@@ -1,0 +1,14 @@
+# Logs
+logs
+*.log
+
+# local
+*.local
+
+# Editor directories and files
+
+# env
+.env
+
+# output
+/output/*
