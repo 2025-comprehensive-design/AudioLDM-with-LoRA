@@ -6,6 +6,7 @@ logs
 *.local
 
 # Editor directories and files
+/wandb/*
 
 # env
 .env
