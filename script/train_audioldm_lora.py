@@ -104,6 +104,7 @@ def main() :
     init_lora_weights="gaussian",
     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
     )
+    
     unet.add_adapter(unet_lora_config)
 
     weight_dtype = torch.float32
