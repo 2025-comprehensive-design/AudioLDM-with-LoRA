@@ -9,7 +9,7 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 
 adapt at app.py to use 
 '''
-import torch, random
+import torch, random, torchaudio
 import numpy as np
 import torch.nn.functional as F
 from tqdm.auto import tqdm
@@ -17,22 +17,91 @@ from matplotlib import pyplot as plt
 from diffusers import AudioLDMPipeline
 from torchaudio import transforms as AT
 from torchvision import transforms as IT
-
-# 시각화 툴
+from peft import LoraConfig, get_peft_model
 import wandb
 
+# 실험 설정
+torch.manual_seed(42)
 base_model_id = "cvssp/audioldm-s-full-v2"
 
+config = {
+    "mode": "text_encoder",
+    "target_modules": [
+        f"text_model.encoder.layer.{i}.attention.self.query" for i in range(12)
+    ] + [
+        f"text_model.encoder.layer.{i}.attention.self.value" for i in range(12)
+    ],
+    "rank": 1,
+    "alpha": 8,
+    "learning_rate": 0.0001,
+    "max_train_steps": 100,
+    "base_model": base_model_id,
+    "prompt": "hiphop",
+    "name": "LoRA_WqWv_rank1"
+}
+
+def compute_snr(reference: torch.Tensor, estimate: torch.Tensor) -> float:
+    """Compute Signal-to-Noise Ratio (SNR) between reference and estimate signals"""
+    reference = reference.view(-1)
+    estimate = estimate.view(-1)
+
+    noise = reference - estimate
+    signal_power = torch.sum(reference ** 2)
+    noise_power = torch.sum(noise ** 2) + 1e-9 
+
+    snr = 10 * torch.log10(signal_power / noise_power)
+    return snr.item()
+
+# wandb 초기화
 run = wandb.init(
-    # Set the wandb entity where your project will be logged (generally your team name).
-    entity="my-awesome-team-name",
-    # Set the wandb project where this run will be logged.
     project="AudioLDM-with-LoRA",
-    # Track hyperparameters and run metadata.
-    config={
-        "learning_rate": 0.02,
-        "architecture": "CNN",
-        "dataset": "CIFAR-100",
-        "epochs": 10,
-    },
+    name=config["name"],
+    config=config
 )
+# AudioLDM 모델 불러오기
+pipe = AudioLDMPipeline.from_pretrained(config["base_model"])
+pipe = pipe.to("cuda" if torch.cuda.is_available() else "cpu")
+
+# text_encoder에 LoRA 적용
+text_encoder = pipe.text_encoder
+
+print("text_encoder 모듈 구조:")
+for name, module in text_encoder.named_modules():
+    print(name)
+
+lora_config = LoraConfig(
+    r=config["rank"],
+    lora_alpha=config["alpha"],
+    init_lora_weights="gaussian",
+    target_modules=config["target_modules"]
+)
+text_encoder = get_peft_model(text_encoder, lora_config)
+pipe.text_encoder = text_encoder
+
+# 오디오 생성 및 wandb 로그
+num_samples = 3
+samples = []
+for i in range(num_samples):
+    result = pipe(config["prompt"], num_inference_steps=30)
+    audio = result["audios"][0]  # numpy ndarray [T]
+    audio_tensor = torch.tensor(audio)
+
+    # 참고용 clean 오디오 불러오기 (길이 맞춰서)
+    ref_waveform, _ = torchaudio.load("path_to_reference.wav")
+    ref_waveform = ref_waveform[0, :audio_tensor.shape[0]]
+
+    # SNR 계산
+    snr_value = compute_snr(ref_waveform, audio_tensor)
+
+    # wandb에 로그 저장
+    wandb.log({
+        f"sample_{i}_snr": snr_value,
+        f"sample_{i}": wandb.Audio(audio, sample_rate=16000, caption=f"{config['prompt']} - {i}")
+    })
+
+# 최종 wandb 로그
+wandb.log({
+    "total_generated": num_samples,
+    "average_snr": np.mean([compute_snr(ref_waveform, torch.tensor(a)) for a in samples])
+})
+wandb.finish()
