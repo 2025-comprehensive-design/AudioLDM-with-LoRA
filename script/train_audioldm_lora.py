@@ -38,13 +38,14 @@ def compute_clap_similarity(audio_waveform: np.ndarray, text: str) -> float:
         audio_embed = F.normalize(audio_embed, dim=-1)
         text_embed = F.normalize(text_embed, dim=-1)
         similarity = (audio_embed @ text_embed.T).item()
+        similarity = (similarity + 1) / 2  # <정규화> [-1,1] => [0, 1]
     return similarity
 
 # 같은 실험값을 위한 seed
 torch.manual_seed(42)
 
 # 실험 설정값
-default_model_id = "cvssp/audioldm-s-full-v2"
+base_model_id = "cvssp/audioldm-s-full-v2"
 config = {
     "mode": "text_encoder",  # LoRA 적용 대상
     "target_modules": [
@@ -55,7 +56,7 @@ config = {
     "rank": 1,  # LoRA 랭크
     "alpha": 8,  # LoRA 스케일링 계수
     "learning_rate": 1e-4,
-    "max_train_steps": 10, # 훈련 횟수수
+    "max_train_steps": 10, # 훈련 횟수
     "prompt": "hiphop",  # 오디오 생성 프롬프트
     "name": "LoRA_WqWv_rank1"
 }
@@ -80,7 +81,7 @@ logger = get_logger(__name__)
 logger.info(accelerator.state, main_process_only=True)
 
 # AudioLDM 모델 로드 
-pipe = AudioLDMPipeline.from_pretrained(default_model_id)
+pipe = AudioLDMPipeline.from_pretrained(base_model_id)
 pipe.to(accelerator.device)
 
 # text_encoder에만 LoRA 적용
@@ -88,9 +89,10 @@ text_encoder = pipe.text_encoder
 lora_config = LoraConfig(
     r=config["rank"],
     lora_alpha=config["alpha"],
+    inference_mode=False,
     init_lora_weights="gaussian",
     target_modules=config["target_modules"]
-)
+    )
 text_encoder = get_peft_model(text_encoder, lora_config)
 
 # unet, vae는 파인튜닝에서 제외 (freeze)
@@ -114,14 +116,27 @@ losses = []
 
 # max_train_steps만큼 오디오 생성,training, loss 계산, CLAP 유사도 계산
 for step in range(config["max_train_steps"]):
+    if step >= config["max_train_steps"]:
+        break
     optimizer.zero_grad()
 
+    # 오디오 생성성
     result = pipe(config["prompt"], num_inference_steps=30) # num_inference_steps == Denoising step의 수
     audio = result["audios"][0]  
     audio_tensor = torch.tensor(audio, requires_grad=True).to(accelerator.device)
 
     ref_waveform, _ = torchaudio.load(ref_path)
-    ref_waveform = ref_waveform[0, :audio_tensor.shape[0]].to(accelerator.device) # audio_tensor => requires_grad=True로 설정해 학습 가능하게게
+    ref_waveform = ref_waveform[0] # audio_tensor => requires_grad=True로 설정해 학습 가능하게게
+    gen_len = audio_tensor.shape[0]
+
+    # 예외처리(reference와 audio_tensor간 길이 상이) => 길이 맞춤 (padding or cropping)
+    if ref_waveform.shape[0] > gen_len:
+        ref_waveform = ref_waveform[:gen_len]
+    elif ref_waveform.shape[0] < gen_len:
+        pad_len = gen_len - ref_waveform.shape[0]
+        ref_waveform = F.pad(ref_waveform, (0, pad_len))
+
+    ref_waveform = ref_waveform.to(accelerator.device)
 
     # 손실 계산 및 학습
     loss = F.mse_loss(audio_tensor, ref_waveform)
@@ -141,9 +156,15 @@ for step in range(config["max_train_steps"]):
         "audio": wandb.Audio(audio, sample_rate=16000, caption=f"{config['prompt']} step {step+1}")
     })
 
+# LoRA 가중치 저장
+save_path = "./data/LoRA_weight/" + config["name"]
+text_encoder.save_pretrained(save_path)
+
+
 # 평균 clap_score, loss 출력
 wandb.log({
     "average_clap_score": np.mean(clap_scores),
     "average_loss": np.mean(losses)
 })
 wandb.finish()
+
