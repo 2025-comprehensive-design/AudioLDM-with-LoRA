@@ -1,35 +1,25 @@
 from diffusers import AudioLDMPipeline
-import datasets
-
-def load_dataset(dataset_name=None, cache_dir=None, train_data_dir=None):
-    if dataset_name is not None:
-        dataset = datasets.load_dataset(
-            dataset_name,
-            cache_dir=cache_dir,
-            data_dir=train_data_dir,
-        )
-    else:
-        data_files = {}
-        if train_data_dir is not None:
-            data_files["train"] = os.path.join(train_data_dir, "**")
-        dataset = datasets.load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=cache_dir,
-        )
-    return dataset
-
-dataset_name = "deetsadi/musiccaps_spectrograms"
-dataset = load_dataset(
-    dataset_name
-)
-
-filtered_dataset = dataset["train"].filter(
-    lambda example: "hiphop" in example["caption"].lower()
-    )
-    
-print(filtered_dataset[0])
-
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 
 base_model_id = "cvssp/audioldm-s-full-v2"
-model = AudioLDMPipeline.from_pretrained(base_model_id)
+pipe = AudioLDMPipeline.from_pretrained(base_model_id)
+noise_scheduler = pipe.scheduler
+tokenizer = pipe.tokenizer
+unet = pipe.unet
+text_encoder = pipe.text_encoder
+vae = pipe.vae
+
+unet.requires_grad_(False)
+vae.requires_grad_(False)
+text_encoder.requires_grad_(False)
+
+
+unet_lora_config = LoraConfig(
+        r=2,
+        lora_alpha=2,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+)
+
+unet = get_peft_model(unet, unet_lora_config)
+unet.print_trainable_parameters()
