@@ -14,35 +14,34 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 sys.path.append("AudioLDM-with-LoRA")
 
-import argparse
+# import argparse
+# import math
 import logging
-import math
 import numpy as np
-from pathlib import Path
+from contextlib import nullcontext
+# from pathlib import Path
 
-import torch, random, torchaudio
+import torch, random
 import torch.nn.functional as F
 import torch.nn as nn
+
 from torchaudio import transforms as AT
 from torchvision import transforms as IT
-from torchvision import transforms
 
-from torch.utils.data import Dataset
-import datasets
-from script.data.datasets import AudioDataset, HfAudioDataset
+# from torch.utils.data import Dataset
+from script.data.datasets import HfAudioDataset
 from datasets import load_dataset
 
 # LoRA 
 from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
 
 from tqdm.auto import tqdm
 from matplotlib import pyplot as plt
 
-from transformers import RobertaTokenizerFast, ClapTextModelWithProjection
-
 from diffusers import AudioLDMPipeline
-from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-from diffusers.utils import is_wandb_available
+# from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
+from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
 
@@ -56,7 +55,8 @@ logger = get_logger(__name__)
 
 base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = ""
-
+validation_prompt = "guitar in hip hop music"
+validation_epochs = 1
 if is_wandb_available():
     import wandb
 
@@ -74,6 +74,50 @@ run = wandb.init(
     },
 )
 
+num_validation_images = 4
+
+def log_validation(
+    pipeline,
+    accelerator,
+    epoch,
+    is_final_validation=False,
+):
+    logger.info(
+        f"Running validation... \n Generating {num_validation_images} mel images with prompt:"
+        f" {validation_prompt}."
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+    generator = torch.Generator(device=accelerator.device)
+    images = []
+    if torch.backends.mps.is_available():
+        autocast_ctx = nullcontext()
+    else:
+        autocast_ctx = torch.autocast(accelerator.device.type)
+
+    with autocast_ctx:
+        for _ in range(num_validation_images):
+            audio_output = pipeline(validation_prompt, num_inference_steps=30, generator=generator)
+            images.append(audio_output.audios[0]) 
+
+    for tracker in accelerator.trackers:
+        phase_name = "test" if is_final_validation else "validation"
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    phase_name: [
+                        wandb.Audio(image, caption=f"{i}: {validation_prompt}") for i, image in enumerate(images)
+                    ]
+                }
+            )
+    return images
+
+
+
 def main() :
 
     accelerator_project_config = ProjectConfiguration(project_dir="./", logging_dir="AudioLDM-with-LoRA/log")
@@ -84,6 +128,11 @@ def main() :
         log_with="wandb",
         project_config=accelerator_project_config,
     )
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
     
     if torch.backends.mps.is_available():
         accelerator.native_amp = False
@@ -133,16 +182,16 @@ def main() :
         eps=1e-08,
     )
     ###
-    def preprocess_train(example):
-        mel = waveform_to_mel_tensor(torch.tensor(example["audio"]["array"]),
-                                    sampling_rate=example["audio"]["sampling_rate"])
+    # def preprocess_train(example):
+    #     mel = waveform_to_mel_tensor(torch.tensor(example["audio"]["array"]),
+    #                                 sampling_rate=example["audio"]["sampling_rate"])
         
-        # tokenizer 결과 전체 반환
-        tokenized = tokenize_captions({"caption": [example["caption"]]})  # ❗ dict
-        return {
-            "audio": mel,
-            "caption": {k: v[0] for k, v in tokenized.items()}  # 각 key에서 첫 번째 값만 추출 (1개 샘플이므로)
-        }
+    #     # tokenizer 결과 전체 반환
+    #     tokenized = tokenize_captions({"caption": [example["caption"]]})  # ❗ dict
+    #     return {
+    #         "audio": mel,
+    #         "caption": {k: v[0] for k, v in tokenized.items()}  # 각 key에서 첫 번째 값만 추출 (1개 샘플이므로)
+    #     }
 
     def tokenize_captions(examples, is_train=True):
         captions = []
@@ -161,109 +210,28 @@ def main() :
         )
         return inputs.input_ids
     
-    mel_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.5], [0.5]),
-    ])
-
-    def waveform_to_mel_tensor(y, sampling_rate=16000, n_fft=1024, hop_length=256, win_length=1024,
-                           n_mels=64, mel_fmin=0.0, mel_fmax=8000.0, device="cpu",
-                           mel_basis_cache={}, hann_window_cache={}):
-        # numpy → torch
-        if isinstance(y, np.ndarray):
-            y = torch.tensor(y, dtype=torch.float32)
-
-        if y.ndim == 1:
-            y = y.unsqueeze(0)  # [1, T]
-
-        if torch.min(y) < -1.0:
-            print("train min value is ", torch.min(y))
-        if torch.max(y) > 1.0:
-            print("train max value is ", torch.max(y))
-
-        mel_key = f"{mel_fmax}_{device}"
-
-        # mel basis caching
-        if mel_key not in mel_basis_cache:
-            import librosa
-            mel = librosa.filters.mel(sr=sampling_rate,
-                                    n_fft=n_fft,
-                                    n_mels=n_mels,
-                                    fmin=mel_fmin,
-                                    fmax=mel_fmax)
-            mel_basis_cache[mel_key] = torch.from_numpy(mel).float().to(device)
-
-        if device not in hann_window_cache:
-            hann_window_cache[device] = torch.hann_window(win_length).to(device)
-
-        # padding
-        y = torch.nn.functional.pad(
-            y.unsqueeze(1),
-            (int((n_fft - hop_length) / 2), int((n_fft - hop_length) / 2)),
-            mode='reflect'
-        ).squeeze(1)
-
-        # STFT
-        stft_spec = torch.stft(
-            y,
-            n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=hann_window_cache[device],
-            center=False,
-            pad_mode="reflect",
-            normalized=False,
-            onesided=True,
-            return_complex=True,
-        )
-        stft_spec = torch.abs(stft_spec).float()  # magnitude
-
-        mel_spec = torch.matmul(mel_basis_cache[mel_key], stft_spec)
-        mel_spec = spectral_normalize_torch(mel_spec)
-
-        return mel_spec[0]  # [n_mels, time]
-    
-    def spectral_normalize_torch(magnitudes, clip_val=1e-5):
-        return torch.log(torch.clamp(magnitudes, min=clip_val))
-
-    # 데이터셋 로드 코드 작성
-    def collate_fn(examples):
-        # MEL 이미지 변환
-        mel_tensors = [waveform_to_mel_tensor(torch.tensor(example["audio"]["array"]),
-                                      sampling_rate=example["audio"]["sampling_rate"]) for example in examples]
-        mel = torch.stack(mel_tensors)
-
-        # 캡션 tokenizer 적용
-        raw_captions = [example["caption"] for example in examples]  # str 목록
-        tokenized = tokenize_captions({"caption": raw_captions}) 
-
-        return {
-            "audio": mel,
-            "caption": tokenized
-        }
-    
-    
-    dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
-    train_dataset = HfAudioDataset(dataset)
-
-    # # caption에 "hiphop" 들어간 것만 필터링
-    # filtered_dataset = dataset.filter(
-    #     lambda example: "hiphop" in example["caption"].lower()
-    # )
-
     num_workers = 0
     train_batch_size = 16
     total_batch_size = train_batch_size * accelerator.num_processes * accelerator.num_processes
-    num_train_epochs = 100
+    num_train_epochs = 10
     gradient_accumulation_steps = 1
     max_train_steps = 15000
+    checkpointing_steps = 500
+    
+    dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
+
+    # caption에 "guitar" 들어간 것만 필터링
+    filtered_dataset = dataset.filter(
+        lambda example: "guitar" in example["caption"].lower()
+    )
+    train_dataset = HfAudioDataset(filtered_dataset)
 
     # 필터링된 데이터셋으로 학습!
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
         batch_size=train_batch_size,
-        num_workers=16,
+        num_workers=num_workers,
     )
 
     lr_scheduler = get_scheduler(
@@ -279,7 +247,6 @@ def main() :
 
     ### Train
     output_dir = "AudioLDM-with-LoRA/data/LoRA_weight"
-
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
@@ -303,21 +270,23 @@ def main() :
         disable=not accelerator.is_local_main_process,
     )
 
-
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         train_loss = 0.0
 
         for step, batch in enumerate(train_dataloader):
+
             with accelerator.accumulate(unet):
-                print(f"batch : {batch['caption'].shape}")
+
                 # Convert images to latent space
-                latents = vae.encode(batch["audio"].unsqueeze(1).to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
+                latents = vae.encode(batch["log_mel_spec"].unsqueeze(1).to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
+
                 if noise_offset:
+                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
                     )
@@ -330,46 +299,76 @@ def main() :
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                batch_size = noisy_latents.shape[0]
 
-                text_input = tokenizer(
-                    "asfd", padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
-                )
-                with torch.no_grad():
-                    text_embeddings = text_encoder(text_input.input_ids.to(latents.device))[0]
+                # Get the text embedding for conditioning
+                ###
+                text_inputs = tokenizer(
+                    batch["text"],
+                    padding="max_length",          # 또는 padding=True
+                    truncation=True,
+                    max_length=tokenizer.model_max_length,
+                    return_tensors="pt"
+                ).to(latents.device)
+                
+                encoder_hidden_states = text_encoder(
+                    input_ids=text_inputs["input_ids"],
+                    return_dict=False
+                )[0]
 
-                max_length = text_input.input_ids.shape[-1]
-                uncond_input = tokenizer([""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
-                uncond_embeddings = text_encoder(uncond_input.input_ids.to(latents.device))[0]
-                uncond_embeddings = text_encoder(batch["caption"], return_dict=False)[0]
-                text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
-                encoder_hidden_states = text_embeddings
+                # encoder_hidden_states = text_encoder(batch["text"], return_dict=False)[0]
 
+                # Get the target for loss depending on the prediction type
                 target = noise
 
-                class_labels = torch.zeros(batch_size, 512).to(dtype=latents.dtype, device=latents.device)
+                # Predict the noise residual and compute loss
+                # model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+                label_vector = batch.get("label_vector", None)
+                if isinstance(label_vector, torch.Tensor) and label_vector.ndim == 2 and label_vector.shape[1] > 0:
+                    class_labels = torch.argmax(label_vector, dim=1)
+                else:
+                    continue
 
                 model_pred = unet(
-                    noisy_latents,
-                    timesteps,
+                    sample=noisy_latents,
+                    timestep=timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     class_labels=class_labels,
                     return_dict=False
                 )[0]
 
-                # Predict the noise residual and compute loss
-                # model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
-                
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                # if args.snr_gamma is None:
+                #     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                # else:
+                #     # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                #     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                #     # This is discussed in Section 4.2 of the same paper.
+                #     snr = compute_snr(noise_scheduler, timesteps)
+                #     mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                #         dim=1
+                #     )[0]
+                #     if noise_scheduler.config.prediction_type == "epsilon":
+                #         mse_loss_weights = mse_loss_weights / snr
+                #     elif noise_scheduler.config.prediction_type == "v_prediction":
+                #         mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                #     loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                #     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                #     loss = loss.mean()
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
-                train_loss += avg_loss.item()
+                train_loss += avg_loss.item() / gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = lora_layers
+                    accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -381,29 +380,31 @@ def main() :
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
-                if global_step % args.checkpointing_steps == 0:
+                # if global_step % args.checkpointing_steps == 0:
+                #     if accelerator.is_main_process:
+                #         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                #         if args.checkpoints_total_limit is not None:
+                #             checkpoints = os.listdir(args.output_dir)
+                #             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                #             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                #             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                #             if len(checkpoints) >= args.checkpoints_total_limit:
+                #                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                #                 removing_checkpoints = checkpoints[0:num_to_remove]
+
+                #                 logger.info(
+                #                     f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                #                 )
+                #                 logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                #                 for removing_checkpoint in removing_checkpoints:
+                #                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                #                     shutil.rmtree(removing_checkpoint)
+
+                if global_step % checkpointing_steps == 0:
                     if accelerator.is_main_process:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
 
                         unwrapped_unet = unwrap_model(unet)
@@ -426,16 +427,15 @@ def main() :
                 break
 
         if accelerator.is_main_process:
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+            if validation_prompt is not None and epoch % validation_epochs == 0:
                 # create pipeline
                 pipeline = AudioLDMPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
+                    base_model_id,
                     unet=unwrap_model(unet),
-                    revision=args.revision,
-                    variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-                images = log_validation(pipeline, args, accelerator, epoch)
+
+                images = log_validation(pipeline, accelerator, epoch)
 
                 del pipeline
                 torch.cuda.empty_cache()
@@ -448,6 +448,7 @@ def main() :
 
         unwrapped_unet = unwrap_model(unet)
         unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
+
         AudioLDMPipeline.save_lora_weights(
             save_directory=output_dir,
             unet_lora_layers=unet_lora_state_dict,
@@ -456,23 +457,34 @@ def main() :
 
         # Final inference
         # Load previous pipeline
-        # if args.validation_prompt is not None:
-        #     pipeline = AudioLDMPipeline.from_pretrained(
-        #         args.pretrained_model_name_or_path,
-        #         revision=args.revision,
-        #         variant=args.variant,
-        #         torch_dtype=weight_dtype,
-        #     )
+        if validation_prompt is not None:
+            pipeline = AudioLDMPipeline.from_pretrained(
+                base_model_id,
+                torch_dtype=weight_dtype,
+            )
 
             # load attention processors
-            # pipeline.load_lora_weights(output_dir)
+            pipeline.load_lora_weights(output_dir)
 
             # run inference
-            # images = log_validation(pipeline, args, accelerator, epoch, is_final_validation=True)
+            images = log_validation(pipeline, accelerator, epoch, is_final_validation=True)
+
+        # if args.push_to_hub:
+        #     save_model_card(
+        #         repo_id,
+        #         images=images,
+        #         base_model=args.pretrained_model_name_or_path,
+        #         dataset_name=args.dataset_name,
+        #         repo_folder=args.output_dir,
+        #     )
+        #     upload_folder(
+        #         repo_id=repo_id,
+        #         folder_path=args.output_dir,
+        #         commit_message="End of training",
+        #         ignore_patterns=["step_*", "epoch_*"],
+        #     )
 
     accelerator.end_training()
-
-
 
 if __name__ == "__main__":
     main()

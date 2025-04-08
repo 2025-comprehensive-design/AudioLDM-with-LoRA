@@ -124,7 +124,7 @@ class HfAudioDataset(Dataset):
             "text": text,  # list
             # "fname": self.text_to_filename(text) if (not fname) else fname,  # list
             # tensor, [batchsize, class_num]
-            "label_vector": "" if (label_vector is None) else label_vector.float(),
+            "label_vector": label_vector.float() if isinstance(label_vector, torch.Tensor) else None,
             # tensor, [batchsize, 1, samples_num]
             "waveform": "" if (waveform is None) else waveform.float(),
             # tensor, [batchsize, t-steps, f-bins]
@@ -136,10 +136,11 @@ class HfAudioDataset(Dataset):
             "random_start_sample_in_original_audio_file": random_start,
         }
 
-        caption = data.get("caption", None)
+        caption = data.get("text", None)
         if caption is None:
-            print(f"Warning: No caption found for index {index}")
+            print(f"Warning: No text found for index {index}")
             caption = ""
+            
 
 
         return data
