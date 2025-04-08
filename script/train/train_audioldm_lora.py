@@ -134,16 +134,15 @@ def main() :
     )
     ###
     def preprocess_train(example):
-        # 오디오를 mel-spectrogram으로 변환
         mel = waveform_to_mel_tensor(torch.tensor(example["audio"]["array"]),
                                     sampling_rate=example["audio"]["sampling_rate"])
-        # caption tokenizer 적용
-        input_ids = tokenize_captions({"caption": [example["caption"]]})[0]  # [0]으로 텐서 하나만 추출
-
+        
+        # tokenizer 결과 전체 반환
+        tokenized = tokenize_captions({"caption": [example["caption"]]})  # ❗ dict
         return {
             "audio": mel,
-            "caption": input_ids
-    }
+            "caption": {k: v[0] for k, v in tokenized.items()}  # 각 key에서 첫 번째 값만 추출 (1개 샘플이므로)
+        }
 
     def tokenize_captions(examples, is_train=True):
         captions = []
@@ -166,8 +165,6 @@ def main() :
         transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5]),
     ])
-
-    preprocess_train
 
     def waveform_to_mel_tensor(y, sampling_rate=16000, n_fft=1024, hop_length=256, win_length=1024,
                            n_mels=64, mel_fmin=0.0, mel_fmax=8000.0, device="cpu",
@@ -247,7 +244,7 @@ def main() :
     
     
     dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
-    dataset.with_transform(preprocess_train)
+    train_dataset = HfAudioDataset(dataset)
 
     # # caption에 "hiphop" 들어간 것만 필터링
     # filtered_dataset = dataset.filter(
@@ -263,10 +260,10 @@ def main() :
 
     # 필터링된 데이터셋으로 학습!
     train_dataloader = torch.utils.data.DataLoader(
-        dataset,
+        train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
         batch_size=train_batch_size,
+        num_workers=16,
     )
 
     lr_scheduler = get_scheduler(
@@ -313,6 +310,7 @@ def main() :
 
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
+                print(f"batch : {batch['caption'].shape}")
                 # Convert images to latent space
                 latents = vae.encode(batch["audio"].unsqueeze(1).to(accelerator.device, dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
@@ -334,28 +332,19 @@ def main() :
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 batch_size = noisy_latents.shape[0]
 
-                # Get the text embedding for conditioning
+                text_input = tokenizer(
+                    "asfd", padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
+                )
+                with torch.no_grad():
+                    text_embeddings = text_encoder(text_input.input_ids.to(latents.device))[0]
 
-                # encoder_hidden_states = text_encoder(batch["caption"], return_dict=False)[0]
-                # tokenized = tokenizer(
-                #     batch["caption"],               # List[str]
-                #     padding="max_length",
-                #     truncation=True,
-                #     max_length=77,
-                #     return_tensors="pt"
-                # )
+                max_length = text_input.input_ids.shape[-1]
+                uncond_input = tokenizer([""] * batch_size, padding="max_length", max_length=max_length, return_tensors="pt")
+                uncond_embeddings = text_encoder(uncond_input.input_ids.to(latents.device))[0]
+                uncond_embeddings = text_encoder(batch["caption"], return_dict=False)[0]
+                text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
-                # input_ids = tokenized.input_ids.to(accelerator.device)
-                # attention_mask = tokenized.attention_mask.to(accelerator.device)
-
-                # # text encoder 통과
-                # text_outputs = text_encoder(input_ids=input_ids, attention_mask=attention_mask)
-                # encoder_hidden_states = text_outputs.last_hidden_state
-
-                # encoder_hidden_states = text_encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-
-                # Get the target for loss depending on the prediction type
-                encoder_hidden_states = text_encoder(batch["caption"].to(accelerator.device))[0]
+                encoder_hidden_states = text_embeddings
 
                 target = noise
 
