@@ -61,21 +61,7 @@ validation_epochs = 1
 if is_wandb_available():
     import wandb
 
-# run = wandb.init(
-#     # Set the wandb entity where your project will be logged (generally your team name).
-#     entity="kimsp0317-dongguk-university",
-#     # Set the wandb project where this run will be logged.
-#     project="AudioLDM-with-LoRA",
-#     # Track hyperparameters and run metadata.
-#     config={
-#         "learning_rate": 0.02,
-#         "architecture": "CNN",
-#         "dataset": "CIFAR-100",
-#         "epochs": 10,
-#     },
-# )
-
-num_validation_images = 4
+num_validation_images = 2
 
 def log_validation(
     pipeline,
@@ -108,13 +94,20 @@ def log_validation(
             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
 
         if tracker.name == "wandb":
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Audio(image, sample_rate=16000 ,caption=f"{i}: {validation_prompt}") for i, image in enumerate(images)
-                    ]
-                }
-            )
+
+            audio_logs = []
+            for i, image in enumerate(images):
+                audio_logs.append(wandb.Audio(image, sample_rate=16000, caption=f"{i}: {validation_prompt}"))
+            tracker.log({phase_name: audio_logs})
+
+            # tracker.log(
+            #     {
+            #         "validation": [
+            #             wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+            #         ]
+            #     }
+            # )
+
     return images
 
 
@@ -218,19 +211,21 @@ def main() :
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         lora_layers,
-        lr=1e-4,
+        lr=1.0e-6,
         betas=(0.9, 0.999),
         weight_decay=1e-4,
         eps=1e-08,
     )
 
-    num_workers = 0
-    train_batch_size = 4
+    num_workers = 2
+    train_batch_size = 2
     total_batch_size = train_batch_size * accelerator.num_processes
     num_train_epochs = 10
     gradient_accumulation_steps = 1
-    max_train_steps = 15000
-    checkpointing_steps = 5
+    max_train_steps = 10000
+    checkpointing_steps = 500
+    total_train_loss = 0.0
+    total_steps = 0
 
     def collate_fn(examples):
         log_mel_spec = torch.stack([example["log_mel_spec"].unsqueeze(0) for example in examples])
@@ -281,7 +276,7 @@ def main() :
     first_epoch = 0
     initial_global_step = 0
 
-    noise_offset = 8
+    noise_offset = 0.0015 # in AudioLDM
 
     progress_bar = tqdm(
         range(0, max_train_steps),
@@ -291,10 +286,22 @@ def main() :
         disable=not accelerator.is_local_main_process,
     )
 
+
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         train_loss = 0.0
-        for step, batch in enumerate(train_dataloader):
+        epoch_total_loss = 0.0
+        num_steps_per_epoch = 0
+
+        progress_bar = tqdm(
+            enumerate(train_dataloader),
+            total=len(train_dataloader),
+            desc=f"Epoch {epoch+1}",
+            disable=not accelerator.is_local_main_process,
+        )
+
+        for step, batch in progress_bar:
+            num_steps_per_epoch += 1
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 latents = vae.encode(batch["log_mel_spec"].to(dtype=weight_dtype)).latent_dist.sample()
@@ -303,134 +310,82 @@ def main() :
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 if noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
                     noise += noise_offset * torch.randn(
                         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
                     )
 
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                # print(f"noisy_latents : {noisy_latents}")
 
-                # Get the text embedding for conditioning
-                
                 encoder_outputs = text_encoder(
                     batch["input_ids"], attention_mask=batch["attention_mask"], return_dict=True
                 )
-
-                # last_hidden_state = encoder_outputs.last_hidden_state
                 attention_mask = encoder_outputs.get("attention_mask")
 
-                # UNet에 전달
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=attention_mask,
-                    attention_mask=attention_mask if attention_mask is not None and 'attention_mask' in inspect.signature(unet.forward).parameters else None,
+                    attention_mask=attention_mask,
                     return_dict=False
                 )[0]
 
-                # Get the target for loss depending on the prediction type
                 target = noise
-
-                # Predict the noise residual and compute loss
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
+                # avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
+                epoch_total_loss += avg_loss.item()
+                total_train_loss += avg_loss.item()
+                total_steps += 1
 
-                # Backpropagate
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
                     params_to_clip = lora_layers
                     accelerator.clip_grad_norm_(params_to_clip, 1.0)
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad()
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+                    progress_bar.set_postfix({"loss": train_loss})
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                    train_loss = 0.0
+                    global_step += 1
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                global_step += 1
-                print(f"train_loss : {train_loss}")
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
-
-                if global_step % checkpointing_steps == 0:
-                    if accelerator.is_main_process:
+                    if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
                         save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-
-                        unwrapped_unet = unwrap_model(unet)
-                        unet_lora_state_dict = convert_state_dict_to_diffusers(
-                            get_peft_model_state_dict(unwrapped_unet)
-                        )
-
-                        # save_lora_weights(
-                        #     save_directory=save_path,
-                        #     unet_lora_layers=unet_lora_state_dict,
-                        #     safe_serialization=True,
-                        # )
-
-                        logger.info(f"Saved state to {save_path}")
-
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            progress_bar.set_postfix(**logs)
+                        # accelerator.save_state(save_path)
+                        # unwrapped_unet = unwrap_model(unet)
+                        # unet.save_lora_weights(save_directory=save_path, unet_lora_layers=convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet)), safe_serialization=True)
+                        # logger.info(f"Saved state to {save_path}")
 
             if global_step >= max_train_steps:
                 break
 
-        if accelerator.is_main_process:
-            if validation_prompt is not None and epoch % validation_epochs == 0:
-                # create pipeline
-                pipeline = AudioLDMPipeline.from_pretrained(
-                    base_model_id,
-                    unet=unwrap_model(unet),
-                    torch_dtype=weight_dtype,
-                )
+            accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
 
-                images = log_validation(pipeline, accelerator, epoch)
+        if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
+            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrap_model(unet), torch_dtype=weight_dtype)
+            images = log_validation(pipeline, accelerator, epoch)
+            del pipeline
+            torch.cuda.empty_cache()
 
-                del pipeline
-                torch.cuda.empty_cache()
+        if global_step >= max_train_steps:
+            break
 
-    # Save the lora layers
     accelerator.wait_for_everyone()
 
     if accelerator.is_main_process:
         unet = unet.to(torch.float32)
-
         unwrapped_unet = unwrap_model(unet)
         unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
+        AudioLDMPipeline.push_to_hub("Rofla/AudioLDM-with-LoRA", unet_lora_state_dict)
 
-        # AudioLDMPipeline.save_lora_weights(
-        #     save_directory=output_dir,
-        #     unet_lora_layers=unet_lora_state_dict,
-        #     safe_serialization=True,
-        # )
-        AudioLDMPipeline.push_to_hub(output_dir, unet_lora_state_dict)
-
-        # Final inference
-        # Load previous pipeline
         if validation_prompt is not None:
-            pipeline = AudioLDMPipeline.from_pretrained(
-                base_model_id,
-                torch_dtype=weight_dtype,
-            )
-
-            # load attention processors
-            # pipeline.load_lora_weights(output_dir)
-
-            # run inference
+            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, torch_dtype=weight_dtype)
             images = log_validation(pipeline, accelerator, epoch, is_final_validation=True)
 
     accelerator.end_training()
