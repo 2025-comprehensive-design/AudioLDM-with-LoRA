@@ -8,6 +8,7 @@ from script.utilities.tools import load_json
 from .dataset_plugin import *
 from librosa.filters import mel as librosa_mel_fn
 import random
+from transformers import RobertaTokenizerFast
 from torch.utils.data import Dataset
 from datasets import DatasetDict
 import torch.nn.functional
@@ -37,6 +38,7 @@ class HfAudioDataset(Dataset):
         waveform_only=False,
         add_ons=[],
     ):
+        self.tokenizer = RobertaTokenizerFast.from_pretrained("cvssp/audioldm-s-full-v2", subfolder="tokenizer")
         self.split = split
         self.pad_wav_start_sample = 0
         self.trim_wav = False
@@ -119,9 +121,22 @@ class HfAudioDataset(Dataset):
             random_start,
         ) = self.feature_extraction(index)
         text = self.get_sample_text_caption(datum, mix_datum, label_vector)
+        caption = text[0] if text else "" # 리스트에서 첫 번째 캡션 추출 (또는 빈 문자열)
+
+        # 텍스트 토큰화
+        inputs = self.tokenizer(
+            caption,
+            padding="max_length",
+            truncation=True,
+            max_length=512,
+            return_tensors="pt"
+        )
+        input_ids = inputs.input_ids.squeeze(0)
+        attention_mask = inputs.attention_mask.squeeze(0)
 
         data = {
-            "text": text,  # list
+            "text": input_ids,  # list
+            "attention_mask": attention_mask,
             # "fname": self.text_to_filename(text) if (not fname) else fname,  # list
             # tensor, [batchsize, class_num]
             "label_vector": label_vector.float() if isinstance(label_vector, torch.Tensor) else None,
