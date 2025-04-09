@@ -1,0 +1,21 @@
+{
+    "experiment": "LoRA_Wv_rank2",
+    "targets": [
+        "text_model.encoder.layer.0.attention.self.value",
+        "text_model.encoder.layer.1.attention.self.value",
+        "text_model.encoder.layer.2.attention.self.value",
+        "text_model.encoder.layer.3.attention.self.value",
+        "text_model.encoder.layer.4.attention.self.value",
+        "text_model.encoder.layer.5.attention.self.value",
+        "text_model.encoder.layer.6.attention.self.value",
+        "text_model.encoder.layer.7.attention.self.value",
+        "text_model.encoder.layer.8.attention.self.value",
+        "text_model.encoder.layer.9.attention.self.value",
+        "text_model.encoder.layer.10.attention.self.value",
+        "text_model.encoder.layer.11.attention.self.value"
+    ],
+    "rank": 2,
+    "alpha": 8,
+    "clap_score": 0.6002639128826559,
+    "loss": 0.04285028986632824
+}

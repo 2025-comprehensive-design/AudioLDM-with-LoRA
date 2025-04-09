@@ -15,7 +15,7 @@
   "lora_dropout": 0.0,
   "modules_to_save": null,
   "peft_type": "LORA",
-  "r": 1,
+  "r": 8,
   "rank_pattern": {},
   "revision": null,
   "target_modules": [
