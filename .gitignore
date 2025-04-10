@@ -12,4 +12,7 @@ wandb/
 .env
 
 # output
+.out
 output/
+script/train/AudioLDM-with-LoRA/
+/data/LoRA_weight/

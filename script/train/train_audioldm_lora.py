@@ -9,6 +9,15 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 
 adapt at app.py to use
 '''
+
+# TODO : emd_mask 처리 과정 다시 확인,
+# TODO : push_to_hub() 다른 파일에서 처리
+# TODO : LoRA weight 처리
+# TODO : config.yaml 설정 파일로 바꾸기.
+# TODO : noise_offset 확인/ AudioLDM 논문 확인 및 적용
+# TODO : LoRA 적용 부분 확인
+# TODO : app.py 구축
+
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -192,10 +201,10 @@ def main() :
     text_encoder.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-        r=2,
-        lora_alpha=4,
+        r=4,
+        lora_alpha=8,
         init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=["to_q", "to_v", "to_out.0"],
     )
     # medel = get_peft_model(unet, unet_lora_config)
 
@@ -211,19 +220,19 @@ def main() :
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         lora_layers,
-        lr=1.0e-6,
+        lr=1.0e-4,
         betas=(0.9, 0.999),
         weight_decay=1e-4,
         eps=1e-08,
     )
 
-    num_workers = 2
-    train_batch_size = 2
+    num_workers = 4
+    train_batch_size = 1
     total_batch_size = train_batch_size * accelerator.num_processes
-    num_train_epochs = 10
+    num_train_epochs = 1
     gradient_accumulation_steps = 1
-    max_train_steps = 10000
-    checkpointing_steps = 500
+    max_train_steps = 1000000
+    checkpointing_steps = 50000
     total_train_loss = 0.0
     total_steps = 0
 
@@ -262,7 +271,7 @@ def main() :
     )
 
     ### Train
-    output_dir = "AudioLDM-with-LoRA/data/LoRA_weight"
+    output_dir = "/AudioLDM-with-LoRA/data/LoRA_weight"
     
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
@@ -309,10 +318,11 @@ def main() :
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
-                if noise_offset:
-                    noise += noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
+
+                # if noise_offset:
+                #     noise += noise_offset * torch.randn(
+                #         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
+                #     )
 
                 bsz = latents.shape[0]
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
@@ -357,7 +367,7 @@ def main() :
 
                     if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
                         save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
-                        # accelerator.save_state(save_path)
+                        accelerator.save_state(save_path)
                         # unwrapped_unet = unwrap_model(unet)
                         # unet.save_lora_weights(save_directory=save_path, unet_lora_layers=convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet)), safe_serialization=True)
                         # logger.info(f"Saved state to {save_path}")
