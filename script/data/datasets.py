@@ -120,8 +120,9 @@ class HfAudioDataset(Dataset):
             (datum, mix_datum),
             random_start,
         ) = self.feature_extraction(index)
+        
         text = self.get_sample_text_caption(datum, mix_datum, label_vector)
-        caption = text[0] if text else "" # 리스트에서 첫 번째 캡션 추출 (또는 빈 문자열)
+        caption = text if text else "" # 리스트에서 첫 번째 캡션 추출 (또는 빈 문자열)
 
         # 텍스트 토큰화
         inputs = self.tokenizer(
@@ -139,7 +140,7 @@ class HfAudioDataset(Dataset):
             "attention_mask": attention_mask,
             # "fname": self.text_to_filename(text) if (not fname) else fname,  # list
             # tensor, [batchsize, class_num]
-            "label_vector": label_vector.float() if isinstance(label_vector, torch.Tensor) else None,
+            "label_vector": label_vector.float() if isinstance(label_vector, torch.Tensor) else torch.zeros(512).float(),
             # tensor, [batchsize, 1, samples_num]
             "waveform": "" if (waveform is None) else waveform.float(),
             # tensor, [batchsize, t-steps, f-bins]

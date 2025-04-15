@@ -12,6 +12,7 @@ wandb/
 .env
 
 # output
+nohup.out
 .out
 output/
 script/train/AudioLDM-with-LoRA/

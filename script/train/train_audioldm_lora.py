@@ -50,10 +50,10 @@ from matplotlib import pyplot as plt
 
 from diffusers import AudioLDMPipeline
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
+from diffusers.utils import check_min_version, is_wandb_available, convert_state_dict_to_diffusers
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
-from transformers import ClapTextModelWithProjection, RobertaTokenizerFast
+from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -119,8 +119,6 @@ def log_validation(
 
     return images
 
-
-
 def main() :
 
     accelerator_project_config = ProjectConfiguration(project_dir="./", logging_dir="AudioLDM-with-LoRA/log")
@@ -139,7 +137,7 @@ def main() :
                 "entity": "kimsp0317-dongguk-university",
                 "group": "gpu-exp-group-1",  # 여러 GPU 실험 묶고 싶을 때
                 "tags": ["lora", "audioldm", "guitar"],
-                "name": "run-name-optional"
+                "name": "<task : r = 2, alpha = 4>"
             }
         }
     )
@@ -159,18 +157,13 @@ def main() :
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    # model 불러오기
-    # pipe = AudioLDMPipeline.from_pretrained(base_model_id)
-
     unet_config = UNet2DConditionModel.load_config("cvssp/audioldm-s-full-v2", subfolder="unet")
 
     # 2. 수정 (class conditioning 관련 설정 제거)
-    unet_config["class_embed_type"] = None
-    unet_config["class_embeddings_concat"] = False
+    unet_config["class_embed_type"] = "simple_projection"
+    unet_config["projection_class_embeddings_input_dim"] = 512
+    unet_config["class_embeddings_concat"] = True
     unet_config["num_class_embeds"] = None  # 또는 0
-
-    if "projection_class_embeddings_input_dim" in unet_config:
-        del unet_config["projection_class_embeddings_input_dim"]
 
     noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
 
@@ -182,18 +175,7 @@ def main() :
 
     vae = AutoencoderKL.from_pretrained(base_model_id, subfolder="vae")
 
-    # Class conditioning 관련 레이어 제거 (config에서 제거했으므로 불필요할 수 있음)
-    # if hasattr(unet, "class_embedding"):
-    #     delattr(unet, "class_embedding")
-    # if hasattr(unet, "projection_class_embeddings"):
-    #     delattr(unet, "projection_class_embeddings")
-    # num_attention_heads = unet.config.num_attention_heads
-    attention_head_dim = unet.config.attention_head_dim
-    if attention_head_dim is None:
-        attention_head_dim = getattr(unet.config, "projection_dim", None)
-
-    if attention_head_dim is None:
-        raise ValueError("UNet config does not have 'attention_head_dim' or 'projection_dim'.")
+    vocoder = SpeechT5HifiGan.from_pretrained(base_model_id, subfolder="vocoder")
 
     # 기존 모델의 가중치는 잠금
     unet.requires_grad_(False)
@@ -201,18 +183,18 @@ def main() :
     text_encoder.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-        r=4,
-        lora_alpha=8,
+        r=2,
+        lora_alpha=4,
         init_lora_weights="gaussian",
         target_modules=["to_q", "to_v", "to_out.0"],
     )
-    # medel = get_peft_model(unet, unet_lora_config)
+    medel = get_peft_model(unet, unet_lora_config)
 
     unet.add_adapter(unet_lora_config)
 
     weight_dtype = torch.float32
-    unet.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
+    unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     lora_layers = filter(lambda p: p.requires_grad, unet.parameters())
@@ -227,9 +209,9 @@ def main() :
     )
 
     num_workers = 4
-    train_batch_size = 1
+    train_batch_size = 2
     total_batch_size = train_batch_size * accelerator.num_processes
-    num_train_epochs = 1
+    num_train_epochs = 100
     gradient_accumulation_steps = 1
     max_train_steps = 1000000
     checkpointing_steps = 50000
@@ -239,8 +221,10 @@ def main() :
     def collate_fn(examples):
         log_mel_spec = torch.stack([example["log_mel_spec"].unsqueeze(0) for example in examples])
         input_ids = torch.stack([example["text"] for example in examples])
-        attention_mask = torch.stack([example["attention_mask"] for example in examples]) # attention mask 스택
-        return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
+        attention_mask = torch.stack([example["attention_mask"] for example in examples])
+        class_labels = torch.stack([example["label_vector"] for example in examples])
+
+        return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask, "class_labels" : class_labels }
 
     dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
 
@@ -262,7 +246,7 @@ def main() :
     lr_scheduler = get_scheduler(
         "constant",
         optimizer=optimizer,
-        num_warmup_steps=500 * accelerator.num_processes,
+        num_warmup_steps = 500 * accelerator.num_processes,
         num_training_steps=max_train_steps * accelerator.num_processes,
     )
 
@@ -329,22 +313,31 @@ def main() :
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 encoder_outputs = text_encoder(
-                    batch["input_ids"], attention_mask=batch["attention_mask"], return_dict=True
+                    batch["input_ids"], return_dict=True
                 )
-                attention_mask = encoder_outputs.get("attention_mask")
+                encoder_hidden_states = encoder_outputs.hidden_states
+                # encoder_hidden_states = text_encoder.text_projection(encoder_hidden_states)
+
+                dummy_class_labels = torch.zeros((bsz, 512), dtype=torch.float32).to(noisy_latents.device)
+
+
+                # print(f"encoder_outputs : {encoder_outputs}")
+                # print(f"noisy_latents : {noisy_latents.shape}")
+                # print(f"timesteps : {timesteps.shape}")
+                # print(f"encoder_hidden_states : {encoder_hidden_states.shape}")
 
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
-                    encoder_hidden_states=attention_mask,
-                    attention_mask=attention_mask,
+                    encoder_hidden_states=encoder_hidden_states,
+                    class_labels=dummy_class_labels,
                     return_dict=False
                 )[0]
 
                 target = noise
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                avg_loss = accelerator.gather(loss.repeat(train_batch_size)).mean()
+                avg_loss = accelerator.gather(loss).mean()
                 # avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
                 epoch_total_loss += avg_loss.item()
@@ -354,6 +347,7 @@ def main() :
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
+                    
                     params_to_clip = lora_layers
                     accelerator.clip_grad_norm_(params_to_clip, 1.0)
                     optimizer.step()
@@ -392,7 +386,7 @@ def main() :
         unet = unet.to(torch.float32)
         unwrapped_unet = unwrap_model(unet)
         unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
-        AudioLDMPipeline.push_to_hub("Rofla/AudioLDM-with-LoRA", unet_lora_state_dict)
+        # AudioLDMPipeline.push_to_hub("Rofla/AudioLDM-with-LoRA", unet_lora_state_dict)
 
         if validation_prompt is not None:
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, torch_dtype=weight_dtype)
