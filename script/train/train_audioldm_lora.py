@@ -10,13 +10,12 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 adapt at app.py to use
 '''
 
-# TODO : emd_mask 처리 과정 다시 확인,
 # TODO : push_to_hub() 다른 파일에서 처리
 # TODO : LoRA weight 처리
 # TODO : config.yaml 설정 파일로 바꾸기.
-# TODO : noise_offset 확인/ AudioLDM 논문 확인 및 적용
 # TODO : LoRA 적용 부분 확인
 # TODO : app.py 구축
+# TODO : LoRA 학습 처리 확인
 
 import os
 import sys
@@ -48,7 +47,7 @@ from peft.utils import get_peft_model_state_dict
 from tqdm.auto import tqdm
 from matplotlib import pyplot as plt
 
-from diffusers import AudioLDMPipeline
+from diffusers import AudioLDMPipeline, StableDiffusionPipeline
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from diffusers.utils import check_min_version, is_wandb_available, convert_state_dict_to_diffusers
 from diffusers.utils.torch_utils import is_compiled_module
@@ -59,11 +58,16 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration
 
+import librosa
+import librosa.display
+import io
+from PIL import Image
+
 logger = get_logger(__name__)
 
 # 시각화 툴
 
-base_model_id = "cvssp/audioldm-s-full-v2"
+base_model_id = "cvssp/audioldm"
 dataset_hub_id = ""
 validation_prompt = "guitar in hip hop music"
 validation_epochs = 1
@@ -71,6 +75,26 @@ if is_wandb_available():
     import wandb
 
 num_validation_images = 2
+
+def plot_spectrogram_to_image(spec, title=None):
+    """Spectrogram NumPy 배열을 PIL 이미지로 변환합니다."""
+    plt.figure(figsize=(10, 4))
+    # dB 스케일로 변환된 spectrogram을 사용한다고 가정
+    img = librosa.display.specshow(spec, sr=16000, hop_length=512,
+                                   x_axis='time', y_axis='mel', cmap='viridis')
+    plt.colorbar(img, format='%+2.0f dB')
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+
+    # Plot을 BytesIO 버퍼에 PNG 형식으로 저장
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    plt.close() # Matplotlib figure 메모리 해제
+    buf.seek(0)
+    # 버퍼에서 PIL 이미지 로드
+    image = Image.open(buf)
+    return image
 
 def log_validation(
     pipeline,
@@ -86,15 +110,31 @@ def log_validation(
     pipeline.set_progress_bar_config(disable=True)
     generator = torch.Generator(device=accelerator.device)
     images = []
+    mel_spectrogram_images = []
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     with autocast_ctx:
-        for _ in range(num_validation_images):
+        for i in range(num_validation_images):
             audio_output = pipeline(validation_prompt, num_inference_steps=30, generator=generator)
             images.append(audio_output.audios[0])
+            
+                # librosa를 사용하여 Mel Spectrogram 계산
+            mel_spec = librosa.feature.melspectrogram(
+                    y=audio_output.audios[0],
+                    sr=16000,
+                    n_fft=1024,
+                    hop_length=160,
+                    n_mels=64
+                )
+                # Power spectrogram을 dB 스케일로 변환
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+
+                # Spectrogram 배열을 시각화된 PIL 이미지로 변환
+            spec_image = plot_spectrogram_to_image(mel_spec_db, title=f"Spectrogram {i}: {validation_prompt}")
+            mel_spectrogram_images.append(spec_image)
 
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
@@ -109,13 +149,12 @@ def log_validation(
                 audio_logs.append(wandb.Audio(image, sample_rate=16000, caption=f"{i}: {validation_prompt}"))
             tracker.log({phase_name: audio_logs})
 
-            # tracker.log(
-            #     {
-            #         "validation": [
-            #             wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
-            #         ]
-            #     }
-            # )
+            spec_image_logs = []
+            for i, spec_img in enumerate(mel_spectrogram_images):
+                print(f"spec_img : {spec_img}")
+                spec_image_logs.append(wandb.Image(spec_img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}"))
+            tracker.log({f"{phase_name}_spectrogram": spec_image_logs})
+            print(f"스펙트로그램 이미지 로그 {len(spec_image_logs)}개 Wandb에 로깅 시도 (epoch: {epoch})")
 
     return images
 
@@ -135,7 +174,7 @@ def main() :
         init_kwargs={
             "wandb": {
                 "entity": "kimsp0317-dongguk-university",
-                "group": "gpu-exp-group-1",  # 여러 GPU 실험 묶고 싶을 때
+                "group": "gpu-exp-group-1",
                 "tags": ["lora", "audioldm", "guitar"],
                 "name": "<task : r = 2, alpha = 4>"
             }
@@ -157,24 +196,17 @@ def main() :
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    unet_config = UNet2DConditionModel.load_config("cvssp/audioldm-s-full-v2", subfolder="unet")
-
-    # 2. 수정 (class conditioning 관련 설정 제거)
-    unet_config["class_embed_type"] = "simple_projection"
-    unet_config["projection_class_embeddings_input_dim"] = 512
-    unet_config["class_embeddings_concat"] = True
+    unet_config = UNet2DConditionModel.load_config(base_model_id, subfolder="unet")
     unet_config["num_class_embeds"] = None  # 또는 0
 
-    noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-
-    tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
-
+    ### model load
     unet = UNet2DConditionModel.from_config(unet_config)
+    pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
 
+    noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+    tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
     text_encoder = ClapTextModelWithProjection.from_pretrained(base_model_id, subfolder="text_encoder")
-
     vae = AutoencoderKL.from_pretrained(base_model_id, subfolder="vae")
-
     vocoder = SpeechT5HifiGan.from_pretrained(base_model_id, subfolder="vocoder")
 
     # 기존 모델의 가중치는 잠금
@@ -186,11 +218,12 @@ def main() :
         r=2,
         lora_alpha=4,
         init_lora_weights="gaussian",
-        target_modules=["to_q", "to_v", "to_out.0"],
+        target_modules=["to_q", "to_k", "to_v"],
     )
-    medel = get_peft_model(unet, unet_lora_config)
 
-    unet.add_adapter(unet_lora_config)
+    unet = get_peft_model(unet, unet_lora_config)
+    # unet.add_adapter(unet_lora_config, "default")
+    # unet.set_adapter("default")
 
     weight_dtype = torch.float32
     vae.to(accelerator.device, dtype=weight_dtype)
@@ -204,7 +237,7 @@ def main() :
         lora_layers,
         lr=1.0e-4,
         betas=(0.9, 0.999),
-        weight_decay=1e-4,
+        weight_decay=1e-2,
         eps=1e-08,
     )
 
@@ -222,9 +255,8 @@ def main() :
         log_mel_spec = torch.stack([example["log_mel_spec"].unsqueeze(0) for example in examples])
         input_ids = torch.stack([example["text"] for example in examples])
         attention_mask = torch.stack([example["attention_mask"] for example in examples])
-        class_labels = torch.stack([example["label_vector"] for example in examples])
 
-        return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask, "class_labels" : class_labels }
+        return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
 
     dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
 
@@ -244,9 +276,9 @@ def main() :
     )
 
     lr_scheduler = get_scheduler(
-        "constant",
+        "polynomial",
         optimizer=optimizer,
-        num_warmup_steps = 500 * accelerator.num_processes,
+        num_warmup_steps = 0, #500 * accelerator.num_processes,
         num_training_steps=max_train_steps * accelerator.num_processes,
     )
 
@@ -255,7 +287,7 @@ def main() :
     )
 
     ### Train
-    output_dir = "/AudioLDM-with-LoRA/data/LoRA_weight"
+    output_dir = "./AudioLDM-with-LoRA/data/LoRA_weight"
     
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
@@ -269,7 +301,7 @@ def main() :
     first_epoch = 0
     initial_global_step = 0
 
-    noise_offset = 0.0015 # in AudioLDM
+    # noise_offset = 0.0015 # in AudioLDM
 
     progress_bar = tqdm(
         range(0, max_train_steps),
@@ -279,9 +311,9 @@ def main() :
         disable=not accelerator.is_local_main_process,
     )
 
-
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
+
         train_loss = 0.0
         epoch_total_loss = 0.0
         num_steps_per_epoch = 0
@@ -296,17 +328,11 @@ def main() :
         for step, batch in progress_bar:
             num_steps_per_epoch += 1
             with accelerator.accumulate(unet):
-                # Convert images to latent space
                 latents = vae.encode(batch["log_mel_spec"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
 
-                # Sample noise that we'll add to the latents
+                
                 noise = torch.randn_like(latents)
-
-                # if noise_offset:
-                #     noise += noise_offset * torch.randn(
-                #         (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                #     )
 
                 bsz = latents.shape[0]
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
@@ -316,21 +342,14 @@ def main() :
                     batch["input_ids"], return_dict=True
                 )
                 encoder_hidden_states = encoder_outputs.hidden_states
-                # encoder_hidden_states = text_encoder.text_projection(encoder_hidden_states)
 
                 dummy_class_labels = torch.zeros((bsz, 512), dtype=torch.float32).to(noisy_latents.device)
-
-
-                # print(f"encoder_outputs : {encoder_outputs}")
-                # print(f"noisy_latents : {noisy_latents.shape}")
-                # print(f"timesteps : {timesteps.shape}")
-                # print(f"encoder_hidden_states : {encoder_hidden_states.shape}")
 
                 model_pred = unet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
-                    class_labels=dummy_class_labels,
+                    # class_labels=dummy_class_labels,
                     return_dict=False
                 )[0]
 
@@ -338,41 +357,48 @@ def main() :
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 avg_loss = accelerator.gather(loss).mean()
-                # avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
                 epoch_total_loss += avg_loss.item()
                 total_train_loss += avg_loss.item()
                 total_steps += 1
 
+                # Backpropagate
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    
                     params_to_clip = lora_layers
                     accelerator.clip_grad_norm_(params_to_clip, 1.0)
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
 
-                    progress_bar.set_postfix({"loss": train_loss})
-                    accelerator.log({"train_loss": train_loss}, step=global_step)
-                    train_loss = 0.0
-                    global_step += 1
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
 
-                    if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
-                        save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        # unwrapped_unet = unwrap_model(unet)
-                        # unet.save_lora_weights(save_directory=save_path, unet_lora_layers=convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet)), safe_serialization=True)
-                        # logger.info(f"Saved state to {save_path}")
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                progress_bar.set_postfix({"loss": train_loss})
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
+                global_step += 1
+
+                if global_step % checkpointing_steps == 0 and accelerator.is_main_process:
+                    save_path = os.path.join(output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    unwrapped_unet = unwrap_model(unet)
+                    unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
+                    # unet.save_pretrained(save_path)
+                    # unet.save_lora_weights(save_directory=save_path, unet_lora_layers=convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet)), safe_serialization=True)
+                    # logger.info(f"Saved state to {save_path}")
+
+            accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
+            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
 
             if global_step >= max_train_steps:
                 break
 
-            accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
-
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
-            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrap_model(unet), torch_dtype=weight_dtype)
+            unwrapped_unet = unwrap_model(unet)
+            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
             images = log_validation(pipeline, accelerator, epoch)
             del pipeline
             torch.cuda.empty_cache()
@@ -389,7 +415,7 @@ def main() :
         # AudioLDMPipeline.push_to_hub("Rofla/AudioLDM-with-LoRA", unet_lora_state_dict)
 
         if validation_prompt is not None:
-            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, torch_dtype=weight_dtype)
+            pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet_lora_state_dict, torch_dtype=weight_dtype)
             images = log_validation(pipeline, accelerator, epoch, is_final_validation=True)
 
     accelerator.end_training()

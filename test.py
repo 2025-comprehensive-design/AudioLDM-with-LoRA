@@ -1,21 +1,29 @@
-from diffusers import AudioLDMPipeline
+from diffusers import AudioLDMPipeline, StableDiffusionPipeline
 
 from datasets import load_dataset, DatasetDict
 from script.data.datasets import HfAudioDataset
 import torch
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
 from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
+import scipy
 
 base_model_id = "cvssp/audioldm-s-full-v2"
-pipe = AudioLDMPipeline.from_pretrained(base_model_id)
+pipe = StableDiffusionPipeline.from_pretrained(base_model_id)
 
-noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
-tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
-unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
-text_encoder = ClapTextModelWithProjection.from_pretrained(base_model_id, subfolder="text_encoder")
-vae = AutoencoderKL.from_pretrained(base_model_id, subfolder="vae")
-vocoder = SpeechT5HifiGan.from_pretrained(base_model_id, subfolder="vocoder")
+# noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
+# tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
+# unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
+# text_encoder = ClapTextModelWithProjection.from_pretrained(base_model_id, subfolder="text_encoder")
+# vae = AutoencoderKL.from_pretrained(base_model_id, subfolder="vae")
+# vocoder = SpeechT5HifiGan.from_pretrained(base_model_id, subfolder="vocoder")
 validation_prompt = "hiphop"
+
+audio = pipe(validation_prompt, num_inference_steps=10, audio_length_in_s=5.0).audios[0]
+
+# save the audio sample as a .wav file
+scipy.io.wavfile.write("techno.wav", rate=16000, data=audio)
+
+
 
 # print(unet.config.num_class_embeds)
 
@@ -57,58 +65,20 @@ from diffusers import UNet2DConditionModel
 # )
 
 # unet = get_peft_model(unet, unet_lora_config)
-# unet.print_trainable_parameters()
-def collate_fn(examples):
-    log_mel_spec = torch.stack([example["log_mel_spec"].unsqueeze(0) for example in examples])
-    input_ids = torch.stack([example["text"] for example in examples])
-    attention_mask = torch.stack([example["attention_mask"] for example in examples]) # attention mask 스택
+# # unet.print_trainable_parameters()
+# def collate_fn(examples):
+#     log_mel_spec = torch.stack([example["log_mel_spec"].unsqueeze(0) for example in examples])
+#     input_ids = torch.stack([example["text"] for example in examples])
+#     attention_mask = torch.stack([example["attention_mask"] for example in examples]) # attention mask 스택
 
-    return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
+#     return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
 
-dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
-train_dataset = HfAudioDataset(dataset)
-train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        batch_size=8,
-        collate_fn=collate_fn,
-        num_workers=16,
-    )
-
-# print(train_dataset.__getitem__(0))
-
-sample = train_dataset[0]
-input_ids = sample["text"]
-emd_mask = sample["attention_mask"]
-print("input_ids:", input_ids)
-print("input_ids.shape:", input_ids.shape)
-print("emd_mask :", emd_mask)
-print("emd_mask :", emd_mask.shape)
-
-decoded = tokenizer.decode(input_ids, skip_special_tokens=False)
-print("Decoded from input_ids:", decoded)
-
-weight_dtype = torch.float32
-for batch in train_dataloader:
-    latents = vae.encode(batch["log_mel_spec"].to(dtype=weight_dtype)).latent_dist.sample()
-    latents = latents * vae.config.scaling_factor
-
-    noise = torch.randn_like(latents)
-    print(f"noise : {noise.shape}")
-    bsz = latents.shape[0]
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
-    print(f"latents : {latents.shape}")
-    print(f"noise : {noise.shape}")
-    print(f"timesteps : {timesteps.shape}")
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-    encoder_outputs = text_encoder( batch["input_ids"], return_dict=True )
-    encoder_hidden_states = encoder_outputs.last_hidden_state
-    attention_mask = encoder_outputs.get("attention_mask")
-    model_pred = unet(
-                    noisy_latents,
-                    timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    attention_mask=attention_mask,
-                    return_dict=False
-                )[0]
+# dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
+# train_dataset = HfAudioDataset(dataset)
+# train_dataloader = torch.utils.data.DataLoader(
+#         train_dataset,
+#         shuffle=True,
+#         batch_size=8,
+#         collate_fn=collate_fn,
+#         num_workers=16,
+#     )
