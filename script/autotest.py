@@ -116,13 +116,14 @@ def run_experiment(config):
         target_modules=config["target_modules"] # LoRA를 적용할 모델 내 파라미터
     )
 
-    # LoRA 설정을 기반으로 text_encoder에 adapter 레이어 삽입(text_encoder만 requries_grad=True)
-    text_encoder = get_peft_model(text_encoder, lora_config)
     
     # text_encoder,VAE와 UNet은 freeze, get_peft_model() 호출 이후 삽입된 LoRA adapter의 파라미터만 학습
     pipe.vae.requires_grad_(False)
     pipe.unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
+
+    # LoRA 설정을 기반으로 text_encoder에 adapter 레이어 삽입(text_encoder만 requries_grad=True)
+    text_encoder = get_peft_model(text_encoder, lora_config)
 
     pipe.text_encoder = text_encoder.to(accelerator.device)
     pipe.to(accelerator.device)
