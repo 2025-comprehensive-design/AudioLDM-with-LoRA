@@ -43,13 +43,14 @@ from datasets import load_dataset
 # LoRA
 from peft import LoraConfig, get_peft_model
 from peft.utils import get_peft_model_state_dict
-
+    
 from tqdm.auto import tqdm
 from matplotlib import pyplot as plt
 
-from diffusers import AudioLDMPipeline, StableDiffusionPipeline
+from diffusers import AudioLDMPipeline
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from diffusers.utils import check_min_version, is_wandb_available, convert_state_dict_to_diffusers
+from diffusers.utils import check_min_version, is_wandb_available # , convert_state_dict_to_diffusers
+# from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
 from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
@@ -67,7 +68,7 @@ logger = get_logger(__name__)
 
 # 시각화 툴
 
-base_model_id = "cvssp/audioldm"
+base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = ""
 validation_prompt = "guitar in hip hop music"
 validation_epochs = 1
@@ -151,10 +152,8 @@ def log_validation(
 
             spec_image_logs = []
             for i, spec_img in enumerate(mel_spectrogram_images):
-                print(f"spec_img : {spec_img}")
                 spec_image_logs.append(wandb.Image(spec_img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}"))
             tracker.log({f"{phase_name}_spectrogram": spec_image_logs})
-            print(f"스펙트로그램 이미지 로그 {len(spec_image_logs)}개 Wandb에 로깅 시도 (epoch: {epoch})")
 
     return images
 
@@ -196,12 +195,13 @@ def main() :
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    unet_config = UNet2DConditionModel.load_config(base_model_id, subfolder="unet")
-    unet_config["num_class_embeds"] = None  # 또는 0
+    # unet_config = UNet2DConditionModel.load_config(base_model_id, subfolder="unet")
+    # unet_config["num_class_embeds"] = None  # 또는 0
 
     ### model load
-    unet = UNet2DConditionModel.from_config(unet_config)
-    pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
+    # unet = UNet2DConditionModel.from_config(unet_config)
+    unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
+    # pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
 
     noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
@@ -218,7 +218,7 @@ def main() :
         r=2,
         lora_alpha=4,
         init_lora_weights="gaussian",
-        target_modules=["to_q", "to_k", "to_v"],
+        target_modules=["to_q", "to_v"],
     )
 
     unet = get_peft_model(unet, unet_lora_config)
@@ -313,6 +313,7 @@ def main() :
 
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
+        optimizer.zero_grad()
 
         train_loss = 0.0
         epoch_total_loss = 0.0
@@ -338,22 +339,101 @@ def main() :
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                encoder_outputs = text_encoder(
-                    batch["input_ids"], return_dict=True
-                )
-                encoder_hidden_states = encoder_outputs.hidden_states
+                input_ids = batch["input_ids"].to(latents.device)   
+                attention_mask = batch["attention_mask"].to(latents.device)
+                
+                # 3차원 텐서를 2차원으로 변환
+                input_ids = input_ids.squeeze(1)
+                attention_mask = attention_mask.squeeze(1)
 
-                dummy_class_labels = torch.zeros((bsz, 512), dtype=torch.float32).to(noisy_latents.device)
+                # 토큰 길이 제한 확인
+                untruncated_ids = tokenizer(
+                    tokenizer.batch_decode(input_ids),
+                    padding="longest",
+                    return_tensors="pt"
+                ).input_ids.to(latents.device)
+
+                if untruncated_ids.shape[-1] >= input_ids.shape[-1] and not torch.equal(
+                    input_ids, untruncated_ids
+                ):
+                    removed_text = tokenizer.batch_decode(
+                        untruncated_ids[:, tokenizer.model_max_length - 1 : -1]
+                    )
+                    
+
+                encoder_outputs = text_encoder(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                    output_hidden_states=True
+                )
+
+                # text_embeds 직접 사용
+                prompt_embeds = encoder_outputs.text_embeds
+                
+                # L2 normalization 적용
+                prompt_embeds = F.normalize(prompt_embeds, dim=-1)
+                
+                # 배치 차원에 대해 반복하여 확장
+                bs_embed, seq_len = prompt_embeds.shape
+                num_waveforms_per_prompt = 1  # 학습 시에는 1로 설정
+                prompt_embeds = prompt_embeds.repeat(1, num_waveforms_per_prompt)
+                prompt_embeds = prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
+
+                # negative prompt 처리 (classifier-free guidance)
+                uncond_tokens = [""] * bsz
+                uncond_input = tokenizer(
+                    uncond_tokens,
+                    padding="max_length",
+                    max_length=input_ids.shape[1],
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                uncond_input_ids = uncond_input.input_ids.to(latents.device)
+                uncond_attention_mask = uncond_input.attention_mask.to(latents.device)
+
+                negative_prompt_embeds = text_encoder(
+                    uncond_input_ids,
+                    attention_mask=uncond_attention_mask,
+                    return_dict=True,
+                ).text_embeds
+                negative_prompt_embeds = F.normalize(negative_prompt_embeds, dim=-1)
+                
+                # negative prompt도 동일하게 확장
+                negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_waveforms_per_prompt)
+                negative_prompt_embeds = negative_prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
+
+                # unconditional과 conditional embeddings를 concatenate
+                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+
+                # latents를 classifier-free guidance를 위해 확장
+                latent_model_input = torch.cat([noisy_latents] * 2)
+                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timesteps)
+
+                # timesteps도 동일하게 확장
+                timesteps = timesteps.repeat(2)
+
+                # attention mask도 동일하게 확장
+                attention_mask = torch.cat([attention_mask] * 2)
+
+                target = noise
 
                 model_pred = unet(
-                    noisy_latents,
+                    latent_model_input,
                     timesteps,
-                    encoder_hidden_states=encoder_hidden_states,
-                    # class_labels=dummy_class_labels,
+                    encoder_hidden_states=None,
+                    # encoder_attention_mask=attention_mask,
+                    class_labels=prompt_embeds,
                     return_dict=False
                 )[0]
 
-                target = noise
+                # unconditional과 conditional prediction 분리
+                noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
+                
+                # guidance scale 적용 (학습 시에는 1.0으로 설정)
+                guidance_scale = 1.0
+                model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 avg_loss = accelerator.gather(loss).mean()
