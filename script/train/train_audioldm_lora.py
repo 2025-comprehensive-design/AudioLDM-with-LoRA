@@ -49,8 +49,7 @@ from matplotlib import pyplot as plt
 
 from diffusers import AudioLDMPipeline
 from diffusers import AutoencoderKL, DDIMScheduler, UNet2DConditionModel
-from diffusers.utils import check_min_version, is_wandb_available # , convert_state_dict_to_diffusers
-# from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
+from diffusers.utils import check_min_version, is_wandb_available, convert_state_dict_to_diffusers
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
 from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
@@ -69,9 +68,9 @@ logger = get_logger(__name__)
 # 시각화 툴
 
 base_model_id = "cvssp/audioldm-s-full-v2"
-dataset_hub_id = ""
-validation_prompt = "guitar in hip hop music"
-validation_epochs = 1
+dataset_hub_id = "mb23/music_caps_4sec_wave_type"
+validation_prompt = "hip hop music"
+validation_epochs = 10
 if is_wandb_available():
     import wandb
 
@@ -119,7 +118,7 @@ def log_validation(
 
     with autocast_ctx:
         for i in range(num_validation_images):
-            audio_output = pipeline(validation_prompt, num_inference_steps=30, generator=generator)
+            audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
             images.append(audio_output.audios[0])
             
                 # librosa를 사용하여 Mel Spectrogram 계산
@@ -127,7 +126,7 @@ def log_validation(
                     y=audio_output.audios[0],
                     sr=16000,
                     n_fft=1024,
-                    hop_length=160,
+                    hop_length=512,
                     n_mels=64
                 )
                 # Power spectrogram을 dB 스케일로 변환
@@ -258,11 +257,11 @@ def main() :
 
         return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
 
-    dataset = load_dataset("mb23/music_caps_4sec_wave_type_classical", split="train")
+    dataset = load_dataset(dataset_hub_id, split="train")
 
     # caption에 "guitar" 들어간 것만 필터링
     filtered_dataset = dataset.filter(
-        lambda example: "guitar" in example["caption"].lower()
+        lambda example: "hiphop" in example["caption"].lower()
     )
     train_dataset = HfAudioDataset(filtered_dataset)
 
@@ -380,61 +379,18 @@ def main() :
                 prompt_embeds = prompt_embeds.repeat(1, num_waveforms_per_prompt)
                 prompt_embeds = prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
 
-                # negative prompt 처리 (classifier-free guidance)
-                uncond_tokens = [""] * bsz
-                uncond_input = tokenizer(
-                    uncond_tokens,
-                    padding="max_length",
-                    max_length=input_ids.shape[1],
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                uncond_input_ids = uncond_input.input_ids.to(latents.device)
-                uncond_attention_mask = uncond_input.attention_mask.to(latents.device)
-
-                negative_prompt_embeds = text_encoder(
-                    uncond_input_ids,
-                    attention_mask=uncond_attention_mask,
-                    return_dict=True,
-                ).text_embeds
-                negative_prompt_embeds = F.normalize(negative_prompt_embeds, dim=-1)
-                
-                # negative prompt도 동일하게 확장
-                negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_waveforms_per_prompt)
-                negative_prompt_embeds = negative_prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
-
-                # unconditional과 conditional embeddings를 concatenate
-                prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
-
-                # latents를 classifier-free guidance를 위해 확장
-                latent_model_input = torch.cat([noisy_latents] * 2)
-                latent_model_input = noise_scheduler.scale_model_input(latent_model_input, timesteps)
-
-                # timesteps도 동일하게 확장
-                timesteps = timesteps.repeat(2)
-
-                # attention mask도 동일하게 확장
-                attention_mask = torch.cat([attention_mask] * 2)
-
-                target = noise
-
+                # 학습 시에는 classifier-free guidance 없이 직접 조건부 학습
                 model_pred = unet(
-                    latent_model_input,
+                    noisy_latents,  # guidance 없이 원본 latents 사용
                     timesteps,
                     encoder_hidden_states=None,
-                    # encoder_attention_mask=attention_mask,
-                    class_labels=prompt_embeds,
+                    class_labels=prompt_embeds,  # 조건부 임베딩만 사용
+                    cross_attention_kwargs={"scale": 1.0},
                     return_dict=False
                 )[0]
 
-                # unconditional과 conditional prediction 분리
-                noise_pred_uncond, noise_pred_text = model_pred.chunk(2)
-                
-                # guidance scale 적용 (학습 시에는 1.0으로 설정)
-                guidance_scale = 1.0
-                model_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                # 직접적인 loss 계산
+                loss = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
                 avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
