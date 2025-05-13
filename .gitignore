@@ -9,6 +9,7 @@ logs
 wandb/
 
 # env
+.yaml
 .env
 
 # output

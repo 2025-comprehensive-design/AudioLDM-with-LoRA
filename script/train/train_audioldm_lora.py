@@ -10,7 +10,6 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 adapt at app.py to use
 '''
 
-# TODO : push_to_hub() 다른 파일에서 처리
 # TODO : LoRA weight 처리
 # TODO : config.yaml 설정 파일로 바꾸기.
 # TODO : LoRA 적용 부분 확인
@@ -22,12 +21,9 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 sys.path.append("AudioLDM-with-LoRA")
 
-# import argparse
-# import math
 import logging
 import numpy as np
 from contextlib import nullcontext
-# from pathlib import Path
 
 import torch, random
 import torch.nn.functional as F
@@ -36,7 +32,7 @@ import torch.nn as nn
 from torchaudio import transforms as AT
 from torchvision import transforms as IT
 
-# from torch.utils.data import Dataset
+
 from script.data.datasets import HfAudioDataset
 from datasets import load_dataset
 
@@ -121,7 +117,7 @@ def log_validation(
             audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
             images.append(audio_output.audios[0])
             
-                # librosa를 사용하여 Mel Spectrogram 계산
+            # librosa를 사용하여 Mel Spectrogram 계산
             mel_spec = librosa.feature.melspectrogram(
                     y=audio_output.audios[0],
                     sr=16000,
@@ -129,10 +125,10 @@ def log_validation(
                     hop_length=512,
                     n_mels=64
                 )
-                # Power spectrogram을 dB 스케일로 변환
+            # Power spectrogram을 dB 스케일로 변환
             mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
 
-                # Spectrogram 배열을 시각화된 PIL 이미지로 변환
+            # Spectrogram 배열을 시각화된 PIL 이미지로 변환
             spec_image = plot_spectrogram_to_image(mel_spec_db, title=f"Spectrogram {i}: {validation_prompt}")
             mel_spectrogram_images.append(spec_image)
 
@@ -158,7 +154,7 @@ def log_validation(
 
 def main() :
 
-    accelerator_project_config = ProjectConfiguration(project_dir="./", logging_dir="AudioLDM-with-LoRA/log")
+    accelerator_project_config = ProjectConfiguration(project_dir="../../", logging_dir="AudioLDM-with-LoRA/log")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
@@ -234,9 +230,9 @@ def main() :
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         lora_layers,
-        lr=1.0e-4,
+        lr=1.0e-5,
         betas=(0.9, 0.999),
-        weight_decay=1e-2,
+        weight_decay=1e-5,
         eps=1e-08,
     )
 
@@ -261,7 +257,7 @@ def main() :
 
     # caption에 "guitar" 들어간 것만 필터링
     filtered_dataset = dataset.filter(
-        lambda example: "hiphop" in example["caption"].lower()
+        lambda example: "guitar" in example["caption"].lower()
     )
     train_dataset = HfAudioDataset(filtered_dataset)
 
@@ -335,6 +331,7 @@ def main() :
                 noise = torch.randn_like(latents)
 
                 bsz = latents.shape[0]
+                
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
@@ -378,6 +375,13 @@ def main() :
                 num_waveforms_per_prompt = 1  # 학습 시에는 1로 설정
                 prompt_embeds = prompt_embeds.repeat(1, num_waveforms_per_prompt)
                 prompt_embeds = prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
+                
+                prompt_bsz = prompt_embeds.shape[0]
+                latents_bsz = batch["log_mel_spec"].shape[0]
+
+                if prompt_bsz != latents_bsz:
+                    repeat_factor = latents_bsz // prompt_bsz
+                    prompt_embeds = prompt_embeds.repeat_interleave(repeat_factor, dim=0)
 
                 # 학습 시에는 classifier-free guidance 없이 직접 조건부 학습
                 model_pred = unet(
