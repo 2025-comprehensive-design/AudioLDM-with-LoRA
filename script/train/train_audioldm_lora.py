@@ -10,7 +10,6 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 adapt at app.py to use
 '''
 
-# TODO : LoRA weight 처리
 # TODO : config.yaml 설정 파일로 바꾸기.
 # TODO : LoRA 적용 부분 확인
 # TODO : app.py 구축
@@ -97,6 +96,7 @@ def log_validation(
     accelerator,
     epoch,
     is_final_validation=False,
+    original_pipeline=None,  # 원본 모델 추가
 ):
     logger.info(
         f"Running validation... \n Generating {num_validation_images} mel images with prompt:"
@@ -104,9 +104,14 @@ def log_validation(
     )
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
+    if original_pipeline:
+        original_pipeline = original_pipeline.to(accelerator.device)
+        original_pipeline.set_progress_bar_config(disable=True)
+
     generator = torch.Generator(device=accelerator.device)
-    images = []
-    mel_spectrogram_images = []
+    images, mel_spectrogram_images = [], []
+    orig_images, orig_mel_spectrogram_images = [], []
+
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
@@ -114,41 +119,43 @@ def log_validation(
 
     with autocast_ctx:
         for i in range(num_validation_images):
+            # Fine-tuned pipeline output
             audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
-            images.append(audio_output.audios[0])
-            
-            # librosa를 사용하여 Mel Spectrogram 계산
-            mel_spec = librosa.feature.melspectrogram(
-                    y=audio_output.audios[0],
-                    sr=16000,
-                    n_fft=1024,
-                    hop_length=512,
-                    n_mels=64
-                )
-            # Power spectrogram을 dB 스케일로 변환
-            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            audio = audio_output.audios[0]
+            images.append(audio)
 
-            # Spectrogram 배열을 시각화된 PIL 이미지로 변환
+            mel_spec = librosa.feature.melspectrogram(y=audio, sr=16000, n_fft=1024, hop_length=512, n_mels=64)
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
             spec_image = plot_spectrogram_to_image(mel_spec_db, title=f"Spectrogram {i}: {validation_prompt}")
             mel_spectrogram_images.append(spec_image)
 
+            # Original pipeline output
+            if original_pipeline:
+                orig_output = original_pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
+                orig_audio = orig_output.audios[0]
+                orig_images.append(orig_audio)
+
+                orig_mel_spec = librosa.feature.melspectrogram(y=orig_audio, sr=16000, n_fft=1024, hop_length=512, n_mels=64)
+                orig_mel_spec_db = librosa.power_to_db(orig_mel_spec, ref=np.max)
+                orig_spec_image = plot_spectrogram_to_image(orig_mel_spec_db, title=f"Original Spectrogram {i}: {validation_prompt}")
+                orig_mel_spectrogram_images.append(orig_spec_image)
+
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
 
         if tracker.name == "wandb":
-
-            audio_logs = []
-            for i, image in enumerate(images):
-                audio_logs.append(wandb.Audio(image, sample_rate=16000, caption=f"{i}: {validation_prompt}"))
+            audio_logs = [wandb.Audio(img, sample_rate=16000, caption=f"{i}: {validation_prompt}") for i, img in enumerate(images)]
             tracker.log({phase_name: audio_logs})
 
-            spec_image_logs = []
-            for i, spec_img in enumerate(mel_spectrogram_images):
-                spec_image_logs.append(wandb.Image(spec_img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}"))
-            tracker.log({f"{phase_name}_spectrogram": spec_image_logs})
+            spec_logs = [wandb.Image(img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(mel_spectrogram_images)]
+            tracker.log({f"{phase_name}_spectrogram": spec_logs})
+
+            if original_pipeline:
+                orig_audio_logs = [wandb.Audio(img, sample_rate=16000, caption=f"Original {i}: {validation_prompt}") for i, img in enumerate(orig_images)]
+                tracker.log({f"original_{phase_name}": orig_audio_logs})
+
+                orig_spec_logs = [wandb.Image(img, caption=f"Original {phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(orig_mel_spectrogram_images)]
+                tracker.log({f"original_{phase_name}_spectrogram": orig_spec_logs})
 
     return images
 
@@ -196,7 +203,7 @@ def main() :
     ### model load
     # unet = UNet2DConditionModel.from_config(unet_config)
     unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
-    # pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
+    pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
 
     noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
@@ -257,7 +264,7 @@ def main() :
 
     # caption에 "guitar" 들어간 것만 필터링
     filtered_dataset = dataset.filter(
-        lambda example: "guitar" in example["caption"].lower()
+        lambda example: "hip hop" in example["caption"].lower()
     )
     train_dataset = HfAudioDataset(filtered_dataset)
 
@@ -439,7 +446,7 @@ def main() :
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
             unwrapped_unet = unwrap_model(unet)
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
-            images = log_validation(pipeline, accelerator, epoch)
+            images = log_validation(pipeline, accelerator, epoch, original_pipeline=pipe,)
             del pipeline
             torch.cuda.empty_cache()
 
