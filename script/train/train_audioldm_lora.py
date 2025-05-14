@@ -48,6 +48,7 @@ from diffusers.utils import check_min_version, is_wandb_available, convert_state
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
 from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
+from transformers import AutoProcessor, ClapModel
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -66,13 +67,14 @@ base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = "mb23/music_caps_4sec_wave_type"
 validation_prompt = "hip hop music"
 validation_epochs = 10
+
+
 if is_wandb_available():
     import wandb
 
-num_validation_images = 2
+num_validation_images = 1
 
 def plot_spectrogram_to_image(spec, title=None):
-    """Spectrogram NumPy 배열을 PIL 이미지로 변환합니다."""
     plt.figure(figsize=(10, 4))
     # dB 스케일로 변환된 spectrogram을 사용한다고 가정
     img = librosa.display.specshow(spec, sr=16000, hop_length=512,
@@ -96,7 +98,9 @@ def log_validation(
     accelerator,
     epoch,
     is_final_validation=False,
-    original_pipeline=None,  # 원본 모델 추가
+    original_pipeline=None,
+    clap_model=None,
+    clap_processor=None,
 ):
     logger.info(
         f"Running validation... \n Generating {num_validation_images} mel images with prompt:"
@@ -111,15 +115,27 @@ def log_validation(
     generator = torch.Generator(device=accelerator.device)
     images, mel_spectrogram_images = [], []
     orig_images, orig_mel_spectrogram_images = [], []
+    clap_scores, original_clap_scores = [], []
 
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
+    def compute_clap_similarity(audio_waveform: np.ndarray, text: str) -> float:
+        inputs = clap_processor(audios=audio_waveform, return_tensors="pt", sampling_rate=48000)
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            audio_embed = clap_model.get_audio_features(**inputs)
+            text_embed = clap_model.get_text_features(**clap_processor(text=text, return_tensors="pt", padding=True).to(accelerator.device))
+            audio_embed = F.normalize(audio_embed, dim=-1)
+            text_embed = F.normalize(text_embed, dim=-1)
+            similarity = (audio_embed @ text_embed.T).item()
+            return (similarity + 1) / 2
+
     with autocast_ctx:
         for i in range(num_validation_images):
-            # Fine-tuned pipeline output
+            # 파인튜닝 모델 출력
             audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
             audio = audio_output.audios[0]
             images.append(audio)
@@ -129,7 +145,15 @@ def log_validation(
             spec_image = plot_spectrogram_to_image(mel_spec_db, title=f"Spectrogram {i}: {validation_prompt}")
             mel_spectrogram_images.append(spec_image)
 
-            # Original pipeline output
+            # CLAP 점수 계산 (파인튜닝 모델)
+            if clap_model and clap_processor:
+                print(f"# CLAP 점수 계산 (파인튜닝 모델)")
+                # 48000Hz로 resample
+                resampled_audio = librosa.resample(audio, orig_sr=16000, target_sr=48000)
+                clap_score = compute_clap_similarity(resampled_audio, validation_prompt)
+                clap_scores.append(clap_score)
+
+            # 원본 모델 출력
             if original_pipeline:
                 orig_output = original_pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
                 orig_audio = orig_output.audios[0]
@@ -140,8 +164,21 @@ def log_validation(
                 orig_spec_image = plot_spectrogram_to_image(orig_mel_spec_db, title=f"Original Spectrogram {i}: {validation_prompt}")
                 orig_mel_spectrogram_images.append(orig_spec_image)
 
+                if clap_model and clap_processor:
+                    print(f"# CLAP 점수 계산 (원본 모델)")
+                    resampled_orig_audio = librosa.resample(orig_audio, orig_sr=16000, target_sr=48000)
+                    original_clap_score = compute_clap_similarity(resampled_orig_audio, validation_prompt)
+                    original_clap_scores.append(original_clap_score)
+
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
+
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+            if original_pipeline:
+                orig_np_images = np.stack([np.asarray(img) for img in orig_images])
+                tracker.writer.add_images(f"original_{phase_name}", orig_np_images, epoch, dataformats="NHWC")
 
         if tracker.name == "wandb":
             audio_logs = [wandb.Audio(img, sample_rate=16000, caption=f"{i}: {validation_prompt}") for i, img in enumerate(images)]
@@ -157,10 +194,22 @@ def log_validation(
                 orig_spec_logs = [wandb.Image(img, caption=f"Original {phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(orig_mel_spectrogram_images)]
                 tracker.log({f"original_{phase_name}_spectrogram": orig_spec_logs})
 
-    return images
+            # CLAP 점수 wandb 로그
+            if accelerator.is_main_process:
+                print("*********TRUE!*********")
+                if clap_scores:
+                    avg_clap_score = np.mean(clap_scores)
+                    wandb.log({f"{phase_name}_clap_score": avg_clap_score}, step=epoch + 10)
+                    # tracker.log({f"{phase_name}_clap_score": avg_clap_score}, step=epoch)
+                if original_clap_scores:
+                    avg_original_clap_score = np.mean(original_clap_scores)
+                    wandb.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch + 10)
+                    # tracker.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch)
+
+    return images, avg_clap_score, avg_original_clap_score
+
 
 def main() :
-
     accelerator_project_config = ProjectConfiguration(project_dir="../../", logging_dir="AudioLDM-with-LoRA/log")
 
     accelerator = Accelerator(
@@ -197,11 +246,9 @@ def main() :
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    # unet_config = UNet2DConditionModel.load_config(base_model_id, subfolder="unet")
-    # unet_config["num_class_embeds"] = None  # 또는 0
+    processor = AutoProcessor.from_pretrained("laion/clap-htsat-fused")
+    clap_model = ClapModel.from_pretrained("laion/clap-htsat-fused").to(accelerator.device)
 
-    ### model load
-    # unet = UNet2DConditionModel.from_config(unet_config)
     unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
     pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
 
@@ -303,8 +350,6 @@ def main() :
     first_epoch = 0
     initial_global_step = 0
 
-    # noise_offset = 0.0015 # in AudioLDM
-
     progress_bar = tqdm(
         range(0, max_train_steps),
         initial=initial_global_step,
@@ -390,12 +435,11 @@ def main() :
                     repeat_factor = latents_bsz // prompt_bsz
                     prompt_embeds = prompt_embeds.repeat_interleave(repeat_factor, dim=0)
 
-                # 학습 시에는 classifier-free guidance 없이 직접 조건부 학습
                 model_pred = unet(
-                    noisy_latents,  # guidance 없이 원본 latents 사용
+                    noisy_latents,
                     timesteps,
                     encoder_hidden_states=None,
-                    class_labels=prompt_embeds,  # 조건부 임베딩만 사용
+                    class_labels=prompt_embeds,
                     cross_attention_kwargs={"scale": 1.0},
                     return_dict=False
                 )[0]
@@ -405,7 +449,6 @@ def main() :
 
                 avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
-                epoch_total_loss += avg_loss.item()
                 total_train_loss += avg_loss.item()
                 total_steps += 1
 
@@ -446,8 +489,20 @@ def main() :
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
             unwrapped_unet = unwrap_model(unet)
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
-            images = log_validation(pipeline, accelerator, epoch, original_pipeline=pipe,)
+            images, avg_clap_score, avg_original_clap_score = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
+                clap_model=clap_model,
+                clap_processor=processor
+            )
+            avg_clap_score = float(avg_clap_score)
+            avg_original_clap_score = float(avg_original_clap_score)
+            
+            accelerator.log({
+                "avg_lora_clap_score": avg_clap_score,
+                "avg_original_clap_score": avg_original_clap_score
+            }, step=global_step)
+
             del pipeline
+
             torch.cuda.empty_cache()
 
         if global_step >= max_train_steps:
@@ -463,7 +518,10 @@ def main() :
 
         if validation_prompt is not None:
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet_lora_state_dict, torch_dtype=weight_dtype)
-            images = log_validation(pipeline, accelerator, epoch, is_final_validation=True)
+            images, avg_clap_score, avg_original_clap_score = log_validation(pipeline, accelerator, epoch, is_final_validation=True, original_pipeline=pipe,
+                clap_model=clap_model,
+                clap_processor=processor
+            )
 
     accelerator.end_training()
 
