@@ -357,13 +357,13 @@ def main() :
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    avg_clap_score = 0.0
+    avg_original_clap_score = 0.0
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         optimizer.zero_grad()
 
         train_loss = 0.0
-        epoch_total_loss = 0.0
         num_steps_per_epoch = 0
 
         progress_bar = tqdm(
@@ -393,22 +393,7 @@ def main() :
                 # 3차원 텐서를 2차원으로 변환
                 input_ids = input_ids.squeeze(1)
                 attention_mask = attention_mask.squeeze(1)
-
-                # 토큰 길이 제한 확인
-                untruncated_ids = tokenizer(
-                    tokenizer.batch_decode(input_ids),
-                    padding="longest",
-                    return_tensors="pt"
-                ).input_ids.to(latents.device)
-
-                if untruncated_ids.shape[-1] >= input_ids.shape[-1] and not torch.equal(
-                    input_ids, untruncated_ids
-                ):
-                    removed_text = tokenizer.batch_decode(
-                        untruncated_ids[:, tokenizer.model_max_length - 1 : -1]
-                    )
                     
-
                 encoder_outputs = text_encoder(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -480,6 +465,11 @@ def main() :
                     # logger.info(f"Saved state to {save_path}")
 
             accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
+            accelerator.log({
+                                "avg_lora_clap_score": avg_clap_score,
+                                "avg_original_clap_score": avg_original_clap_score
+                            }, step=global_step)
+            
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
@@ -489,18 +479,12 @@ def main() :
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
             unwrapped_unet = unwrap_model(unet)
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
-            images, avg_clap_score, avg_original_clap_score = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
+            images, avg_clap_score_A, avg_original_clap_score_A = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
                 clap_model=clap_model,
                 clap_processor=processor
             )
-            avg_clap_score = float(avg_clap_score)
-            avg_original_clap_score = float(avg_original_clap_score)
-            
-            accelerator.log({
-                "avg_lora_clap_score": avg_clap_score,
-                "avg_original_clap_score": avg_original_clap_score
-            }, step=global_step)
-
+            avg_clap_score = float(avg_clap_score_A)
+            avg_original_clap_score = float(avg_original_clap_score_A)
             del pipeline
 
             torch.cuda.empty_cache()
