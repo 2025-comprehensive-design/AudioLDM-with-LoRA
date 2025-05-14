@@ -1,0 +1,30 @@
+base_model_id: "cvssp/audioldm-s-full-v2"
+dataset_hub_id: "mb23/music_caps_4sec_wave_type"
+output_dir: "./AudioLDM-with-LoRA/data/LoRA_weight"
+validation_prompt: "hip hop music"
+validation_epochs: 10
+num_validation_images: 2
+
+wandb:
+  entity: "kimsp0317-dongguk-university"
+  group: "gpu-exp-group-1"
+  tags: ["lora", "audioldm", "guitar"]
+  name: "<task : r = 2, alpha = 4>"
+
+lora:
+  r: 2
+  lora_alpha: 4
+  init_lora_weights: "gaussian"
+  target_modules: ["to_q", "to_v"]
+
+train:
+  num_workers: 4
+  train_batch_size: 2
+  num_train_epochs: 100
+  max_train_steps: 1000000
+  checkpointing_steps: 50000
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-08
