@@ -10,33 +10,24 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 adapt at app.py to use
 '''
 
-# TODO : push_to_hub() 다른 파일에서 처리
-# TODO : LoRA weight 처리
-# TODO : config.yaml 설정 파일로 바꾸기.
-# TODO : LoRA 적용 부분 확인
-# TODO : app.py 구축
-# TODO : LoRA 학습 처리 확인
-
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 sys.path.append("AudioLDM-with-LoRA")
 
-# import argparse
-# import math
 import logging
 import numpy as np
 from contextlib import nullcontext
-# from pathlib import Path
 
 import torch, random
 import torch.nn.functional as F
 import torch.nn as nn
 
+import torchaudio
 from torchaudio import transforms as AT
 from torchvision import transforms as IT
 
-# from torch.utils.data import Dataset
+
 from script.data.datasets import HfAudioDataset
 from datasets import load_dataset
 
@@ -53,6 +44,7 @@ from diffusers.utils import check_min_version, is_wandb_available, convert_state
 from diffusers.utils.torch_utils import is_compiled_module
 from diffusers.optimization import get_scheduler
 from transformers import ClapTextModelWithProjection, RobertaTokenizerFast, SpeechT5HifiGan
+from transformers import AutoProcessor, ClapModel
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -63,6 +55,8 @@ import librosa.display
 import io
 from PIL import Image
 
+
+
 logger = get_logger(__name__)
 
 # 시각화 툴
@@ -70,14 +64,15 @@ logger = get_logger(__name__)
 base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = "mb23/music_caps_4sec_wave_type"
 validation_prompt = "hip hop music"
-validation_epochs = 10
+validation_epochs = 5
+SCALE_FACTOR = 100
+
 if is_wandb_available():
     import wandb
 
-num_validation_images = 2
+num_validation_images = 10
 
 def plot_spectrogram_to_image(spec, title=None):
-    """Spectrogram NumPy 배열을 PIL 이미지로 변환합니다."""
     plt.figure(figsize=(10, 4))
     # dB 스케일로 변환된 spectrogram을 사용한다고 가정
     img = librosa.display.specshow(spec, sr=16000, hop_length=512,
@@ -101,6 +96,9 @@ def log_validation(
     accelerator,
     epoch,
     is_final_validation=False,
+    original_pipeline=None,
+    clap_model=None,
+    clap_processor=None,
 ):
     logger.info(
         f"Running validation... \n Generating {num_validation_images} mel images with prompt:"
@@ -108,57 +106,212 @@ def log_validation(
     )
     pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
+    if original_pipeline:
+        original_pipeline = original_pipeline.to(accelerator.device)
+        original_pipeline.set_progress_bar_config(disable=True)
+
     generator = torch.Generator(device=accelerator.device)
-    images = []
-    mel_spectrogram_images = []
+    images, mel_spectrogram_images = [], []
+    orig_images, orig_mel_spectrogram_images = [], []
+    clap_scores, original_clap_scores = [], []
+
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
+    def compute_clap_similarity(audio_waveform: np.ndarray, text: str) -> float:
+        inputs = clap_processor(audios=audio_waveform, return_tensors="pt", sampling_rate=48000)
+        inputs = {k: v.to(accelerator.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            audio_embed = clap_model.get_audio_features(**inputs)
+            text_embed = clap_model.get_text_features(**clap_processor(text=text, return_tensors="pt", padding=True).to(accelerator.device))
+            audio_embed = F.normalize(audio_embed, dim=-1)
+            text_embed = F.normalize(text_embed, dim=-1)
+            similarity = (audio_embed @ text_embed.T).item()
+            return (similarity + 1) / 2
+
     with autocast_ctx:
         for i in range(num_validation_images):
+            # 파인튜닝 모델 출력
             audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
-            images.append(audio_output.audios[0])
-            
-                # librosa를 사용하여 Mel Spectrogram 계산
-            mel_spec = librosa.feature.melspectrogram(
-                    y=audio_output.audios[0],
-                    sr=16000,
-                    n_fft=1024,
-                    hop_length=512,
-                    n_mels=64
-                )
-                # Power spectrogram을 dB 스케일로 변환
-            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            audio = audio_output.audios[0]
+            images.append(audio)
 
-                # Spectrogram 배열을 시각화된 PIL 이미지로 변환
+            mel_spec = librosa.feature.melspectrogram(y=audio, sr=16000, n_fft=1024, hop_length=512, n_mels=64)
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
             spec_image = plot_spectrogram_to_image(mel_spec_db, title=f"Spectrogram {i}: {validation_prompt}")
             mel_spectrogram_images.append(spec_image)
 
+            # CLAP 점수 계산 (파인튜닝 모델)
+            if clap_model and clap_processor:
+                print(f"# CLAP 점수 계산 (파인튜닝 모델)")
+                # 48000Hz로 resample
+                resampled_audio = librosa.resample(audio, orig_sr=16000, target_sr=48000)
+                clap_score = compute_clap_similarity(resampled_audio, validation_prompt)
+                clap_scores.append(clap_score)
+
+            # 원본 모델 출력
+            if original_pipeline:
+                orig_output = original_pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
+                orig_audio = orig_output.audios[0]
+                orig_images.append(orig_audio)
+
+                orig_mel_spec = librosa.feature.melspectrogram(y=orig_audio, sr=16000, n_fft=1024, hop_length=512, n_mels=64)
+                orig_mel_spec_db = librosa.power_to_db(orig_mel_spec, ref=np.max)
+                orig_spec_image = plot_spectrogram_to_image(orig_mel_spec_db, title=f"Original Spectrogram {i}: {validation_prompt}")
+                orig_mel_spectrogram_images.append(orig_spec_image)
+
+                if clap_model and clap_processor:
+                    print(f"# CLAP 점수 계산 (원본 모델)")
+                    resampled_orig_audio = librosa.resample(orig_audio, orig_sr=16000, target_sr=48000)
+                    original_clap_score = compute_clap_similarity(resampled_orig_audio, validation_prompt)
+                    original_clap_scores.append(original_clap_score)
+
     for tracker in accelerator.trackers:
         phase_name = "test" if is_final_validation else "validation"
+
         if tracker.name == "tensorboard":
             np_images = np.stack([np.asarray(img) for img in images])
             tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+            if original_pipeline:
+                orig_np_images = np.stack([np.asarray(img) for img in orig_images])
+                tracker.writer.add_images(f"original_{phase_name}", orig_np_images, epoch, dataformats="NHWC")
 
         if tracker.name == "wandb":
-
-            audio_logs = []
-            for i, image in enumerate(images):
-                audio_logs.append(wandb.Audio(image, sample_rate=16000, caption=f"{i}: {validation_prompt}"))
+            audio_logs = [wandb.Audio(img, sample_rate=16000, caption=f"{i}: {validation_prompt}") for i, img in enumerate(images)]
             tracker.log({phase_name: audio_logs})
 
-            spec_image_logs = []
-            for i, spec_img in enumerate(mel_spectrogram_images):
-                spec_image_logs.append(wandb.Image(spec_img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}"))
-            tracker.log({f"{phase_name}_spectrogram": spec_image_logs})
+            spec_logs = [wandb.Image(img, caption=f"{phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(mel_spectrogram_images)]
+            tracker.log({f"{phase_name}_spectrogram": spec_logs})
 
-    return images
+            if original_pipeline:
+                orig_audio_logs = [wandb.Audio(img, sample_rate=16000, caption=f"Original {i}: {validation_prompt}") for i, img in enumerate(orig_images)]
+                tracker.log({f"original_{phase_name}": orig_audio_logs})
+
+                orig_spec_logs = [wandb.Image(img, caption=f"Original {phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(orig_mel_spectrogram_images)]
+                tracker.log({f"original_{phase_name}_spectrogram": orig_spec_logs})
+
+            # CLAP 점수 wandb 로그
+            if accelerator.is_main_process:
+                print("*********TRUE!*********")
+                if clap_scores:
+                    avg_clap_score = np.mean(clap_scores)
+                    wandb.log({f"{phase_name}_clap_score": avg_clap_score}, step=epoch + 10)
+                    # tracker.log({f"{phase_name}_clap_score": avg_clap_score}, step=epoch)
+                if original_clap_scores:
+                    avg_original_clap_score = np.mean(original_clap_scores)
+                    wandb.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch + 10)
+                    # tracker.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch)
+
+                if len(images) == len(orig_images):
+                    kad_score = compute_clap_kad_from_audio_lists(
+                        ref_audios=orig_images,
+                        gen_audios=images,
+                        clap_model=clap_model,
+                        clap_processor=clap_processor,
+                        device=accelerator.device)
+                    wandb.log({f"{phase_name}_kad_score": kad_score}, step=epoch + 10)
+
+    return images, avg_clap_score, avg_original_clap_score, kad_score
+
+
+def median_pairwise_distance(x, subsample=None):
+    x = torch.tensor(x, dtype=torch.float32)
+    n_samples = x.shape[0]
+    if subsample is not None and subsample < n_samples * (n_samples - 1) / 2:
+        idx1 = torch.randint(0, n_samples, (subsample,))
+        idx2 = torch.randint(0, n_samples, (subsample,))
+        mask = idx1 == idx2
+        idx2[mask] = (idx2[mask] + 1) % n_samples
+        distances = torch.sqrt(torch.sum((x[idx1] - x[idx2])**2, dim=1))
+    else:
+        distances = torch.pdist(x)
+    return torch.median(distances).item()
+
+def calc_kernel_audio_distance(x, y, device="cuda", bandwidth=None, kernel='gaussian', eps=1e-8):
+    x = x.to(dtype=torch.float32, device=device)
+    y = y.to(dtype=torch.float32, device=device)
+
+    print(f"[KAD] x shape: {x.shape}, y shape: {y.shape}")
+    print(f"[KAD] x norm: {torch.norm(x, dim=1)}")
+    print(f"[KAD] y norm: {torch.norm(y, dim=1)}")
+
+    if bandwidth is None:
+        bandwidth = median_pairwise_distance(y)
+        if bandwidth < 1e-6 or torch.isnan(torch.tensor(bandwidth)):
+            print(f"[KAD] Warning: bandwidth too small or NaN, fallback to 1.0")
+            bandwidth = 1.0  # 기본값 보정
+
+    gamma = 1 / (2 * bandwidth**2 + eps)
+    if kernel == 'gaussian':
+        kernel_fn = lambda a: torch.exp(-gamma * a)
+    elif kernel == 'iq':
+        kernel_fn = lambda a: 1 / (1 + gamma * a)
+    elif kernel == 'imq':
+        kernel_fn = lambda a: 1 / torch.sqrt(1 + gamma * a)
+    else:
+        raise ValueError("Invalid kernel type")
+
+    # x-x
+    xx = x @ x.T
+    x_sqnorms = torch.diagonal(xx)
+    d2_xx = x_sqnorms.unsqueeze(1) + x_sqnorms.unsqueeze(0) - 2 * xx
+    k_xx = kernel_fn(d2_xx)
+    k_xx = k_xx - torch.diag(torch.diagonal(k_xx))
+    k_xx_mean = k_xx.sum() / (x.shape[0] * (x.shape[0] - 1))
+
+    # y-y
+    yy = y @ y.T
+    y_sqnorms = torch.diagonal(yy)
+    d2_yy = y_sqnorms.unsqueeze(1) + y_sqnorms.unsqueeze(0) - 2 * yy
+    k_yy = kernel_fn(d2_yy)
+    k_yy = k_yy - torch.diag(torch.diagonal(k_yy))
+    k_yy_mean = k_yy.sum() / (y.shape[0] * (y.shape[0] - 1))
+
+    # x-y
+    xy = x @ y.T
+    d2_xy = x_sqnorms.unsqueeze(1) + y_sqnorms.unsqueeze(0) - 2 * xy
+    k_xy = kernel_fn(d2_xy)
+    k_xy_mean = k_xy.mean()
+
+    result = k_xx_mean + k_yy_mean - 2 * k_xy_mean
+    return result * SCALE_FACTOR
+
+def compute_clap_kad_from_audio_lists(ref_audios, gen_audios, clap_model, clap_processor, device="cuda"):
+    import torch
+    import torch.nn.functional as F
+    import librosa
+    import numpy as np
+
+    ref_embeddings = []
+    gen_embeddings = []
+
+    for idx, (ref_audio, gen_audio) in enumerate(zip(ref_audios, gen_audios)):
+        ref_audio_rs = librosa.resample(ref_audio, orig_sr=16000, target_sr=48000)
+        gen_audio_rs = librosa.resample(gen_audio, orig_sr=16000, target_sr=48000)
+
+        ref_inputs = clap_processor(audios=ref_audio_rs, return_tensors="pt", sampling_rate=48000).to(device)
+        gen_inputs = clap_processor(audios=gen_audio_rs, return_tensors="pt", sampling_rate=48000).to(device)
+
+        with torch.no_grad():
+            ref_embed = clap_model.get_audio_features(**ref_inputs)
+            gen_embed = clap_model.get_audio_features(**gen_inputs)
+
+            ref_embed = F.normalize(ref_embed, dim=-1)
+            gen_embed = F.normalize(gen_embed, dim=-1)
+
+        ref_embeddings.append(ref_embed.squeeze(0))
+        gen_embeddings.append(gen_embed.squeeze(0))
+
+    ref_tensor = torch.stack(ref_embeddings)  # [B, D]
+    gen_tensor = torch.stack(gen_embeddings)  # [B, D]
+
+    kad_score = calc_kernel_audio_distance(ref_tensor, gen_tensor, device=device)
+    return kad_score.item()
 
 def main() :
-
-    accelerator_project_config = ProjectConfiguration(project_dir="./", logging_dir="AudioLDM-with-LoRA/log")
+    accelerator_project_config = ProjectConfiguration(project_dir="../../", logging_dir="AudioLDM-with-LoRA/log")
 
     accelerator = Accelerator(
         gradient_accumulation_steps=1,
@@ -171,14 +324,13 @@ def main() :
         config=accelerator_project_config,
         init_kwargs={
             "wandb": {
-                "entity": "kimsp0317-dongguk-university",
-                "group": "gpu-exp-group-1",
+                "entity": "3634lelee-dongguk-university",
+                #"group": "gpu-exp-group-1",
                 "tags": ["lora", "audioldm", "guitar"],
                 "name": "<task : r = 2, alpha = 4>"
-            }
-        }
+           }
+       }
     )
-
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
@@ -194,13 +346,11 @@ def main() :
     )
     logger.info(accelerator.state, main_process_only=False)
 
-    # unet_config = UNet2DConditionModel.load_config(base_model_id, subfolder="unet")
-    # unet_config["num_class_embeds"] = None  # 또는 0
+    processor = AutoProcessor.from_pretrained("laion/clap-htsat-fused")
+    clap_model = ClapModel.from_pretrained("laion/clap-htsat-fused").to(accelerator.device)
 
-    ### model load
-    # unet = UNet2DConditionModel.from_config(unet_config)
     unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
-    # pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
+    pipe = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet)
 
     noise_scheduler = DDIMScheduler.from_pretrained(base_model_id, subfolder="scheduler")
     tokenizer = RobertaTokenizerFast.from_pretrained(base_model_id, subfolder="tokenizer")
@@ -234,9 +384,9 @@ def main() :
     optimizer_cls = torch.optim.AdamW
     optimizer = optimizer_cls(
         lora_layers,
-        lr=1.0e-4,
+        lr=1.0e-5,
         betas=(0.9, 0.999),
-        weight_decay=1e-2,
+        weight_decay=1e-5,
         eps=1e-08,
     )
 
@@ -245,7 +395,7 @@ def main() :
     total_batch_size = train_batch_size * accelerator.num_processes
     num_train_epochs = 100
     gradient_accumulation_steps = 1
-    max_train_steps = 1000000
+    max_train_steps = 300000
     checkpointing_steps = 50000
     total_train_loss = 0.0
     total_steps = 0
@@ -261,7 +411,7 @@ def main() :
 
     # caption에 "guitar" 들어간 것만 필터링
     filtered_dataset = dataset.filter(
-        lambda example: "hiphop" in example["caption"].lower()
+        lambda example: "hip hop" in example["caption"].lower()
     )
     train_dataset = HfAudioDataset(filtered_dataset)
 
@@ -300,8 +450,6 @@ def main() :
     first_epoch = 0
     initial_global_step = 0
 
-    # noise_offset = 0.0015 # in AudioLDM
-
     progress_bar = tqdm(
         range(0, max_train_steps),
         initial=initial_global_step,
@@ -309,13 +457,14 @@ def main() :
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-
+    avg_clap_score = 0.0
+    avg_original_clap_score = 0.0
+    kad_score=0.0
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         optimizer.zero_grad()
 
         train_loss = 0.0
-        epoch_total_loss = 0.0
         num_steps_per_epoch = 0
 
         progress_bar = tqdm(
@@ -335,6 +484,7 @@ def main() :
                 noise = torch.randn_like(latents)
 
                 bsz = latents.shape[0]
+                
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
@@ -344,22 +494,7 @@ def main() :
                 # 3차원 텐서를 2차원으로 변환
                 input_ids = input_ids.squeeze(1)
                 attention_mask = attention_mask.squeeze(1)
-
-                # 토큰 길이 제한 확인
-                untruncated_ids = tokenizer(
-                    tokenizer.batch_decode(input_ids),
-                    padding="longest",
-                    return_tensors="pt"
-                ).input_ids.to(latents.device)
-
-                if untruncated_ids.shape[-1] >= input_ids.shape[-1] and not torch.equal(
-                    input_ids, untruncated_ids
-                ):
-                    removed_text = tokenizer.batch_decode(
-                        untruncated_ids[:, tokenizer.model_max_length - 1 : -1]
-                    )
                     
-
                 encoder_outputs = text_encoder(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -378,13 +513,19 @@ def main() :
                 num_waveforms_per_prompt = 1  # 학습 시에는 1로 설정
                 prompt_embeds = prompt_embeds.repeat(1, num_waveforms_per_prompt)
                 prompt_embeds = prompt_embeds.view(bs_embed * num_waveforms_per_prompt, seq_len)
+                
+                prompt_bsz = prompt_embeds.shape[0]
+                latents_bsz = batch["log_mel_spec"].shape[0]
 
-                # 학습 시에는 classifier-free guidance 없이 직접 조건부 학습
+                if prompt_bsz != latents_bsz:
+                    repeat_factor = latents_bsz // prompt_bsz
+                    prompt_embeds = prompt_embeds.repeat_interleave(repeat_factor, dim=0)
+
                 model_pred = unet(
-                    noisy_latents,  # guidance 없이 원본 latents 사용
+                    noisy_latents,
                     timesteps,
                     encoder_hidden_states=None,
-                    class_labels=prompt_embeds,  # 조건부 임베딩만 사용
+                    class_labels=prompt_embeds,
                     cross_attention_kwargs={"scale": 1.0},
                     return_dict=False
                 )[0]
@@ -394,7 +535,6 @@ def main() :
 
                 avg_loss = accelerator.gather(loss).mean()
                 train_loss += avg_loss.item() / gradient_accumulation_steps
-                epoch_total_loss += avg_loss.item()
                 total_train_loss += avg_loss.item()
                 total_steps += 1
 
@@ -426,6 +566,12 @@ def main() :
                     # logger.info(f"Saved state to {save_path}")
 
             accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
+            accelerator.log({
+                                "avg_lora_clap_score": avg_clap_score,
+                                "avg_original_clap_score": avg_original_clap_score,
+                                "kad_score": kad_score
+                            }, step=global_step)
+            
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
@@ -435,8 +581,15 @@ def main() :
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
             unwrapped_unet = unwrap_model(unet)
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
-            images = log_validation(pipeline, accelerator, epoch)
+            images, avg_clap_score_A, avg_original_clap_score_A,kad_score_A = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
+                clap_model=clap_model,
+                clap_processor=processor
+            )
+            avg_clap_score = float(avg_clap_score_A)
+            avg_original_clap_score = float(avg_original_clap_score_A)
+            kad_score = float(kad_score_A) if kad_score_A is not None else 0.0
             del pipeline
+
             torch.cuda.empty_cache()
 
         if global_step >= max_train_steps:
@@ -452,9 +605,11 @@ def main() :
 
         if validation_prompt is not None:
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet_lora_state_dict, torch_dtype=weight_dtype)
-            images = log_validation(pipeline, accelerator, epoch, is_final_validation=True)
+            images, avg_clap_score, avg_original_clap_score = log_validation(pipeline, accelerator, epoch, is_final_validation=True, original_pipeline=pipe,
+                clap_model=clap_model,
+                clap_processor=processor
+            )
 
     accelerator.end_training()
-
 if __name__ == "__main__":
     main()
