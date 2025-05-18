@@ -67,7 +67,7 @@ logger = get_logger(__name__)
 base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = "Rofla/AudioLDM-with-LoRA-Hiphop-subgenre"
 validation_prompt = "hip hop music, The subgenre of hip-hop is boom bap."
-validation_epochs = 10
+validation_epochs = 100
 SCALE_FACTOR = 100
 
 if is_wandb_available():
