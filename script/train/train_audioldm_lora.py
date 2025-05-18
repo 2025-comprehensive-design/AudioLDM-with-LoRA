@@ -64,8 +64,8 @@ logger = get_logger(__name__)
 # 시각화 툴
 
 base_model_id = "cvssp/audioldm-s-full-v2"
-dataset_hub_id = "mb23/music_caps_4sec_wave_type"
-validation_prompt = "hip hop music"
+dataset_hub_id = "Rofla/AudioLDM-with-LoRA-Hiphop-subgenre"
+validation_prompt = "hip hop music, The subgenre of hip-hop is boom bap."
 validation_epochs = 10
 
 
@@ -308,12 +308,8 @@ def main() :
         return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
 
     dataset = load_dataset(dataset_hub_id, split="train")
-
-    # caption에 "guitar" 들어간 것만 필터링
-    filtered_dataset = dataset.filter(
-        lambda example: "hip hop" in example["caption"].lower()
-    )
-    train_dataset = HfAudioDataset(filtered_dataset)
+    
+    train_dataset = HfAudioDataset(dataset)
 
     # 필터링된 데이터셋으로 학습!
     train_dataloader = torch.utils.data.DataLoader(
