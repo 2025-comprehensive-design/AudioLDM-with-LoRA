@@ -55,6 +55,11 @@ import librosa.display
 import io
 from PIL import Image
 
+import torch, gc
+
+gc.collect()
+torch.cuda.empty_cache()
+
 logger = get_logger(__name__)
 
 # 시각화 툴
