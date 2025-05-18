@@ -10,11 +10,6 @@ you can choose Base_model for training LoRA weight and save at [AudioLDM-with-Lo
 adapt at app.py to use
 '''
 
-# TODO : config.yaml 설정 파일로 바꾸기.
-# TODO : LoRA 적용 부분 확인
-# TODO : app.py 구축
-# TODO : LoRA 학습 처리 확인
-
 import os
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
@@ -28,6 +23,7 @@ import torch, random
 import torch.nn.functional as F
 import torch.nn as nn
 
+import torchaudio
 from torchaudio import transforms as AT
 from torchvision import transforms as IT
 
@@ -66,13 +62,13 @@ logger = get_logger(__name__)
 base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = "Rofla/AudioLDM-with-LoRA-Hiphop-subgenre"
 validation_prompt = "hip hop music, The subgenre of hip-hop is boom bap."
-validation_epochs = 10
-
+validation_epochs = 1
+SCALE_FACTOR = 100
 
 if is_wandb_available():
     import wandb
 
-num_validation_images = 1
+num_validation_images = 5
 
 def plot_spectrogram_to_image(spec, title=None):
     plt.figure(figsize=(10, 4))
@@ -101,6 +97,7 @@ def log_validation(
     original_pipeline=None,
     clap_model=None,
     clap_processor=None,
+    ref_audios=None
 ):
     logger.info(
         f"Running validation... \n Generating {num_validation_images} mel images with prompt:"
@@ -116,6 +113,7 @@ def log_validation(
     images, mel_spectrogram_images = [], []
     orig_images, orig_mel_spectrogram_images = [], []
     clap_scores, original_clap_scores = [], []
+    kad_score_lora, kad_score_original=[],[]
 
     if torch.backends.mps.is_available():
         autocast_ctx = nullcontext()
@@ -194,7 +192,7 @@ def log_validation(
                 orig_spec_logs = [wandb.Image(img, caption=f"Original {phase_name} Spectrogram {i}: {validation_prompt}") for i, img in enumerate(orig_mel_spectrogram_images)]
                 tracker.log({f"original_{phase_name}_spectrogram": orig_spec_logs})
 
-            # CLAP 점수 wandb 로그
+            # wandb 로그
             if accelerator.is_main_process:
                 print("*********TRUE!*********")
                 if clap_scores:
@@ -206,7 +204,116 @@ def log_validation(
                     wandb.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch + 10)
                     # tracker.log({f"original_{phase_name}_clap_score": avg_original_clap_score}, step=epoch)
 
-    return images, avg_clap_score, avg_original_clap_score
+                if len(images) == len(orig_images):
+                    kad_score_lora = compute_clap_kad_from_audio_lists(
+                    ref_audios=ref_audios,
+                    gen_audios=images,
+                    clap_model=clap_model,
+                    clap_processor=clap_processor,
+                    device=accelerator.device
+                    )
+
+                    kad_score_original = compute_clap_kad_from_audio_lists(
+                    ref_audios=ref_audios,
+                    gen_audios=orig_images,
+                    clap_model=clap_model,
+                    clap_processor=clap_processor,
+                    device=accelerator.device)
+
+                    wandb.log({f"{phase_name}_kad_score_lora": kad_score_lora,
+                               f"{phase_name}_kad_score_original": kad_score_original}, step=epoch + 10)
+
+    return images, avg_clap_score, avg_original_clap_score, kad_score_lora, kad_score_original
+
+
+def median_pairwise_distance(x, subsample=None):
+    x = torch.tensor(x, dtype=torch.float32)
+    n_samples = x.shape[0]
+    if subsample is not None and subsample < n_samples * (n_samples - 1) / 2:
+        idx1 = torch.randint(0, n_samples, (subsample,))
+        idx2 = torch.randint(0, n_samples, (subsample,))
+        mask = idx1 == idx2
+        idx2[mask] = (idx2[mask] + 1) % n_samples
+        distances = torch.sqrt(torch.sum((x[idx1] - x[idx2])**2, dim=1))
+    else:
+        distances = torch.pdist(x)
+    return torch.median(distances).item()
+
+def calc_kernel_audio_distance(x, y, device="cuda", bandwidth=None, kernel='gaussian', eps=1e-8):
+    x = x.to(dtype=torch.float32, device=device)
+    y = y.to(dtype=torch.float32, device=device)
+
+    print(f"[KAD] x shape: {x.shape}, y shape: {y.shape}")
+    print(f"[KAD] x norm: {torch.norm(x, dim=1)}")
+    print(f"[KAD] y norm: {torch.norm(y, dim=1)}")
+
+    if bandwidth is None:
+        bandwidth = median_pairwise_distance(y)
+        if bandwidth < 1e-6 or torch.isnan(torch.tensor(bandwidth)):
+            print(f"[KAD] Warning: bandwidth too small or NaN, fallback to 1.0")
+            bandwidth = 1.0  # 기본값 보정
+
+    gamma = 1 / (2 * bandwidth**2 + eps)
+    if kernel == 'gaussian':
+        kernel_fn = lambda a: torch.exp(-gamma * a)
+    elif kernel == 'iq':
+        kernel_fn = lambda a: 1 / (1 + gamma * a)
+    elif kernel == 'imq':
+        kernel_fn = lambda a: 1 / torch.sqrt(1 + gamma * a)
+    else:
+        raise ValueError("Invalid kernel type")
+
+    # x-x
+    xx = x @ x.T
+    x_sqnorms = torch.diagonal(xx)
+    d2_xx = x_sqnorms.unsqueeze(1) + x_sqnorms.unsqueeze(0) - 2 * xx
+    k_xx = kernel_fn(d2_xx)
+    k_xx = k_xx - torch.diag(torch.diagonal(k_xx))
+    k_xx_mean = k_xx.sum() / (x.shape[0] * (x.shape[0] - 1))
+
+    # y-y
+    yy = y @ y.T
+    y_sqnorms = torch.diagonal(yy)
+    d2_yy = y_sqnorms.unsqueeze(1) + y_sqnorms.unsqueeze(0) - 2 * yy
+    k_yy = kernel_fn(d2_yy)
+    k_yy = k_yy - torch.diag(torch.diagonal(k_yy))
+    k_yy_mean = k_yy.sum() / (y.shape[0] * (y.shape[0] - 1))
+
+    # x-y
+    xy = x @ y.T
+    d2_xy = x_sqnorms.unsqueeze(1) + y_sqnorms.unsqueeze(0) - 2 * xy
+    k_xy = kernel_fn(d2_xy)
+    k_xy_mean = k_xy.mean()
+
+    result = k_xx_mean + k_yy_mean - 2 * k_xy_mean
+    return result * SCALE_FACTOR
+
+def compute_clap_kad_from_audio_lists(ref_audios, gen_audios, clap_model, clap_processor, device="cuda"):
+    ref_embeddings = []
+    gen_embeddings = []
+
+    for idx, (ref_audio, gen_audio) in enumerate(zip(ref_audios, gen_audios)):
+        ref_audio_rs = librosa.resample(ref_audio, orig_sr=16000, target_sr=48000)
+        gen_audio_rs = librosa.resample(gen_audio, orig_sr=16000, target_sr=48000)
+
+        ref_inputs = clap_processor(audios=ref_audio_rs, return_tensors="pt", sampling_rate=48000).to(device)
+        gen_inputs = clap_processor(audios=gen_audio_rs, return_tensors="pt", sampling_rate=48000).to(device)
+
+        with torch.no_grad():
+            ref_embed = clap_model.get_audio_features(**ref_inputs)
+            gen_embed = clap_model.get_audio_features(**gen_inputs)
+
+            ref_embed = F.normalize(ref_embed, dim=-1)
+            gen_embed = F.normalize(gen_embed, dim=-1)
+
+        ref_embeddings.append(ref_embed.squeeze(0))
+        gen_embeddings.append(gen_embed.squeeze(0))
+
+    ref_tensor = torch.stack(ref_embeddings)  # [B, D]
+    gen_tensor = torch.stack(gen_embeddings)  # [B, D]
+
+    kad_score = calc_kernel_audio_distance(ref_tensor, gen_tensor, device=device)
+    return kad_score.item()
 
 
 def main() :
@@ -225,7 +332,7 @@ def main() :
             "wandb": {
                 "entity": "kimsp0317-dongguk-university",
                 "group": "gpu-exp-group-1",
-                "tags": ["lora", "audioldm", "guitar"],
+                "tags": ["lora", "audioldm", "subgenre"],
                 "name": "<task : r = 2, alpha = 4>"
             }
         }
@@ -264,8 +371,8 @@ def main() :
     text_encoder.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-        r=2,
-        lora_alpha=4,
+        r=1,
+        lora_alpha=2,
         init_lora_weights="gaussian",
         target_modules=["to_q", "to_v"],
     )
@@ -293,9 +400,9 @@ def main() :
     num_workers = 4
     train_batch_size = 2
     total_batch_size = train_batch_size * accelerator.num_processes
-    num_train_epochs = 100
+    num_train_epochs = 10
     gradient_accumulation_steps = 1
-    max_train_steps = 1000000
+    max_train_steps = 10000
     checkpointing_steps = 50000
     total_train_loss = 0.0
     total_steps = 0
@@ -308,8 +415,11 @@ def main() :
         return {"log_mel_spec": log_mel_spec, "input_ids": input_ids, "attention_mask" : attention_mask}
 
     dataset = load_dataset(dataset_hub_id, split="train")
-    
     train_dataset = HfAudioDataset(dataset)
+
+    ref_audios = [librosa.util.fix_length(example["audio"]["array"], size=16000*10) for example in dataset.select(range(num_validation_images))
+]
+
 
     # 필터링된 데이터셋으로 학습!
     train_dataloader = torch.utils.data.DataLoader(
@@ -355,6 +465,8 @@ def main() :
     )
     avg_clap_score = 0.0
     avg_original_clap_score = 0.0
+    kad_score_lora = 0.0
+    kad_score_original = 0.0
     for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         optimizer.zero_grad()
@@ -463,7 +575,9 @@ def main() :
             accelerator.log({"total_train_loss": total_train_loss / total_steps if total_steps > 0 else 0.0}, step=global_step)
             accelerator.log({
                                 "avg_lora_clap_score": avg_clap_score,
-                                "avg_original_clap_score": avg_original_clap_score
+                                "avg_original_clap_score": avg_original_clap_score,
+                                "kad_score_lora": kad_score_lora,
+                                "kad_score_original": kad_score_original
                             }, step=global_step)
             
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
@@ -475,12 +589,14 @@ def main() :
         if accelerator.is_main_process and validation_prompt is not None and epoch % validation_epochs == 0:
             unwrapped_unet = unwrap_model(unet)
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unwrapped_unet, torch_dtype=weight_dtype)
-            images, avg_clap_score_A, avg_original_clap_score_A = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
+            images, avg_clap_score_A, avg_original_clap_score_A, kad_score_lora_A, kad_score_original_A = log_validation(pipeline, accelerator, epoch,original_pipeline=pipe,
                 clap_model=clap_model,
-                clap_processor=processor
+                clap_processor=processor, ref_audios=ref_audios
             )
             avg_clap_score = float(avg_clap_score_A)
             avg_original_clap_score = float(avg_original_clap_score_A)
+            kad_score_lora = float(kad_score_lora_A)
+            kad_score_original = float(kad_score_original_A)
             del pipeline
 
             torch.cuda.empty_cache()
@@ -498,9 +614,9 @@ def main() :
 
         if validation_prompt is not None:
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet_lora_state_dict, torch_dtype=weight_dtype)
-            images, avg_clap_score, avg_original_clap_score = log_validation(pipeline, accelerator, epoch, is_final_validation=True, original_pipeline=pipe,
+            images, avg_clap_score_A, avg_original_clap_score_A, kad_score_lora_A, kad_score_original_A = log_validation(pipeline, accelerator, epoch, is_final_validation=True, original_pipeline=pipe,
                 clap_model=clap_model,
-                clap_processor=processor
+                clap_processor=processor, ref_audios=ref_audios
             )
 
     accelerator.end_training()
