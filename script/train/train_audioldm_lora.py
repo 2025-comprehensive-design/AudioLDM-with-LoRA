@@ -62,7 +62,7 @@ logger = get_logger(__name__)
 base_model_id = "cvssp/audioldm-s-full-v2"
 dataset_hub_id = "Rofla/AudioLDM-with-LoRA-Hiphop-subgenre"
 validation_prompt = "hip hop music, The subgenre of hip-hop is boom bap."
-validation_epochs = 1
+validation_epochs = 10
 SCALE_FACTOR = 100
 
 if is_wandb_available():
@@ -371,8 +371,8 @@ def main() :
     text_encoder.requires_grad_(False)
 
     unet_lora_config = LoraConfig(
-        r=1,
-        lora_alpha=2,
+        r=2,
+        lora_alpha=4,
         init_lora_weights="gaussian",
         target_modules=["to_q", "to_v"],
     )
@@ -400,10 +400,10 @@ def main() :
     num_workers = 4
     train_batch_size = 2
     total_batch_size = train_batch_size * accelerator.num_processes
-    num_train_epochs = 10
+    num_train_epochs = 1000
     gradient_accumulation_steps = 1
-    max_train_steps = 10000
-    checkpointing_steps = 50000
+    max_train_steps = 97000
+    checkpointing_steps = 9700 * 2
     total_train_loss = 0.0
     total_steps = 0
 
