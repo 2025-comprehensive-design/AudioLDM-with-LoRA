@@ -9,6 +9,7 @@ logs
 wandb/
 
 # env
+.yaml
 .env
 
 # output
@@ -18,3 +19,4 @@ nohup.out
 output/
 script/train/AudioLDM-with-LoRA/
 /data/LoRA_weight/
+/data/dataset/out/
