@@ -442,7 +442,10 @@ def main() :
     )
 
     ### Train
-    output_dir = "./AudioLDM-with-LoRA/data/LoRA_weight"
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    output_dir = os.path.join(project_root, "data", "LoRA_weight")
+
+    os.makedirs(output_dir, exist_ok=True)
     
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(dataset)}")
