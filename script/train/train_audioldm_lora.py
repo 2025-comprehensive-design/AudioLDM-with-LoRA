@@ -448,7 +448,7 @@ def main() :
 
     ### Train
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-    output_dir = os.path.join(project_root, "data", "LoRA_weight")
+    output_dir = os.path.join(project_root, "data", "LoRA_weight", "r2_alpha2")
 
     os.makedirs(output_dir, exist_ok=True)
     
@@ -613,12 +613,10 @@ def main() :
             break
 
     accelerator.wait_for_everyone()
-
     if accelerator.is_main_process:
         unet = unet.to(torch.float32)
         unwrapped_unet = unwrap_model(unet)
         unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
-        # AudioLDMPipeline.push_to_hub("Rofla/AudioLDM-with-LoRA", unet_lora_state_dict)
 
         if validation_prompt is not None:
             pipeline = AudioLDMPipeline.from_pretrained(base_model_id, unet=unet_lora_state_dict, torch_dtype=weight_dtype)
