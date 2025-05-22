@@ -11,7 +11,7 @@ def main():
     pipe = AudioLDMPipeline.from_pretrained(base_model_id)
     
     # LoRA 가중치 경로
-    lora_weights_path = "/home/2020112030/WorkSpace/2025/AudioLDM-with-LoRA/data/LoRA_weight/checkpoint-97000/model.safetensors"
+    lora_weights_path = "/home/2020112030/WorkSpace/2025/AudioLDM-with-LoRA/data/LoRA_weight/r2_alpha4/checkpoint-97000/model.safetensors"
     
     # LoRA 가중치 로드
     unet = UNet2DConditionModel.from_pretrained(base_model_id, subfolder="unet")
@@ -26,7 +26,7 @@ def main():
     pipe = pipe.to(device)
     
     # 생성할 프롬프트 설정
-    prompt = "hip hop music, The subgenre of hip-hop is boom bap."
+    prompt = "This instrumental track blends lively flute melodies together with punchy drums, delivering a unique listening experience that captivates the ear without the need for vocals. The subgenre of hip-hop is boom bap"
     
     # 오디오 생성
     audio = pipe(
@@ -37,11 +37,10 @@ def main():
     ).audios[0]
     
     # 결과 저장
-    output_dir = "./generated_audio"
+    output_dir = "./generated_audio_LoRA"
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, prompt + "_97000_r2_alpha4_003.wav")
+    output_path = os.path.join(output_dir, "97000_r2_alpha4_002.wav")
     sf.write(output_path, audio, samplerate=16000)
-    
     print(f"Generated audio saved to: {output_path}")
 
 if __name__ == "__main__":

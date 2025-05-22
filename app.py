@@ -11,7 +11,6 @@ pipe = pipe.to("cuda")
 # pipe.unet.load_attn_procs(lora_weight_pth)
 
 prompt = "classic music sound like sad and piano"
-audio = pipe(prompt, num_inference_steps=200, audio_length_in_s=10.0).audios[0]
+audio = pipe(prompt, num_inference_steps=200, audio_length_in_s=4.0).audios[0]
 
 scipy.io.wavfile.write("techno.wav", rate=16000, data=audio)
-

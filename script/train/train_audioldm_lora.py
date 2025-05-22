@@ -139,7 +139,7 @@ def log_validation(
     with autocast_ctx:
         for i in range(num_validation_images):
             # 파인튜닝 모델 출력
-            audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
+            audio_output = pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=4.0)
             audio = audio_output.audios[0]
             images.append(audio)
 
@@ -158,7 +158,7 @@ def log_validation(
 
             # 원본 모델 출력
             if original_pipeline:
-                orig_output = original_pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=10.0)
+                orig_output = original_pipeline(validation_prompt, num_inference_steps=50, generator=generator, audio_length_in_s=4.0)
                 orig_audio = orig_output.audios[0]
                 orig_images.append(orig_audio)
 
@@ -338,7 +338,7 @@ def main() :
                 "entity": "kimsp0317-dongguk-university",
                 "group": "gpu-exp-group-1",
                 "tags": ["lora", "audioldm", "subgenre"],
-                "name": "<task : r = 2, alpha = 4>"
+                "name": "<task : r = 2, alpha = 2>"
             }
         }
     )
@@ -377,7 +377,7 @@ def main() :
 
     unet_lora_config = LoraConfig(
         r=2,
-        lora_alpha=4,
+        lora_alpha=2,
         init_lora_weights="gaussian",
         target_modules=["to_q", "to_v"],
     )
