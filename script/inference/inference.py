@@ -75,31 +75,42 @@ def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device
     return calc_kernel_audio_distance(gen_tensor, ref_tensor, device=device)
 
 def main():
-    prompt = "hip hop music, The subgenre of hip-hop is boom bap."
-    audio_dir = "./AudioLDM-with-LoRA/generated_audio/max_train_30000_checkpoint-5000"
+    prompt = "This instrumental track blends lively flute melodies together with punchy drums, delivering a unique listening experience that captivates the ear without the need for vocals. The subgenre of hip-hop is boom bap."
+    gen_dir = "/home/2019111986/AudioLDM-LoRA-unet/AudioLDM-with-LoRA/generated_audio/checkpoint-20000"
+    ref_dir = "/home/2019111986/AudioLDM-LoRA-unet/script/inference/kad_music"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Load CLAP model
     clap_processor = AutoProcessor.from_pretrained("laion/clap-htsat-fused")
     clap_model = ClapModel.from_pretrained("laion/clap-htsat-fused").to(device)
 
-    audios = []
-    for fname in sorted(os.listdir(audio_dir)):
-        if fname.endswith(".wav"):
-            path = os.path.join(audio_dir, fname)
-            audio, sr = librosa.load(path, sr=16000)
-            audios.append(audio)
-            print(f"[✓] Loaded {fname}")
+    def load_audios_from_dir(directory, label):
+        audios = []
+        for fname in sorted(os.listdir(directory)):
+            if fname.endswith(".wav"):
+                path = os.path.join(directory, fname)
+                audio, _ = librosa.load(path, sr=16000)
+                audios.append(audio)
+                print(f"Loaded {label} file: {fname}")
+        return audios
 
+    gen_audios = load_audios_from_dir(gen_dir, "generated")
+    ref_audios = load_audios_from_dir(ref_dir, "reference")
+
+    # CLAP score
+    print("\nCLAP Scores (Prompt vs. Generated):")
     clap_scores = []
-    for i, audio in enumerate(audios):
+    for i, audio in enumerate(gen_audios):
         resampled_audio = librosa.resample(audio, orig_sr=16000, target_sr=48000)
         score = compute_clap_score(resampled_audio, prompt, clap_model, clap_processor, device)
         clap_scores.append(score)
         print(f" - gen_{i}.wav | CLAP score: {score:.4f}")
+    avg_clap = sum(clap_scores) / len(clap_scores)
+    print(f"\nAverage CLAP Score: {avg_clap:.4f}")
 
-    # 현재 kad score는 일단 함수만 추가 
-    # kad_score = compute_kad_score(audios, audios, clap_model, clap_processor, device)
-
+    # KAD score
+    kad_score = compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device)
+    print(f"\nKAD Score (Generated vs. Reference): {kad_score:.4f}")
 
 if __name__ == "__main__":
     main()
