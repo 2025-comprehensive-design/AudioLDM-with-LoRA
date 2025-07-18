@@ -53,6 +53,7 @@ def calc_kernel_audio_distance(x, y, device="cuda", bandwidth=None):
     return (k_xx_mean + k_yy_mean - 2 * k_xy_mean).item()
 
 def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1):
+def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1):
     gen_embeds, ref_embeds = [], []
 
     for gen, ref in zip(gen_audios, ref_audios):
@@ -72,6 +73,7 @@ def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device
     gen_tensor = torch.stack(gen_embeds)
     ref_tensor = torch.stack(ref_embeds)
 
+    return calc_kernel_audio_distance(gen_tensor, ref_tensor, device=device, bandwidth=bandwidth)
     return calc_kernel_audio_distance(gen_tensor, ref_tensor, device=device, bandwidth=bandwidth)
 
 def main():
@@ -99,7 +101,23 @@ def main():
 
     # CLAP score
     print("\nCLAP Scores (Prompt vs. Generated):")
+    def load_audios_from_dir(directory, label):
+        audios = []
+        for fname in sorted(os.listdir(directory)):
+            if fname.endswith(".wav"):
+                path = os.path.join(directory, fname)
+                audio, _ = librosa.load(path, sr=16000)
+                audios.append(audio)
+                print(f"Loaded {label} file: {fname}")
+        return audios
+
+    gen_audios = load_audios_from_dir(gen_dir, "generated")
+    ref_audios = load_audios_from_dir(ref_dir, "reference")
+
+    # CLAP score
+    print("\nCLAP Scores (Prompt vs. Generated):")
     clap_scores = []
+    for i, audio in enumerate(gen_audios):
     for i, audio in enumerate(gen_audios):
         resampled_audio = librosa.resample(audio, orig_sr=16000, target_sr=48000)
         score = compute_clap_score(resampled_audio, prompt, clap_model, clap_processor, device)
@@ -107,7 +125,12 @@ def main():
         print(f" - gen_{i}.wav | CLAP score: {score:.4f}")
     avg_clap = sum(clap_scores) / len(clap_scores)
     print(f"\nAverage CLAP Score: {avg_clap:.4f}")
+    avg_clap = sum(clap_scores) / len(clap_scores)
+    print(f"\nAverage CLAP Score: {avg_clap:.4f}")
 
+    # KAD score
+    kad_score = compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1)
+    print(f"\nKAD Score (Generated vs. Reference): {kad_score:.4f}")
     # KAD score
     kad_score = compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1)
     print(f"\nKAD Score (Generated vs. Reference): {kad_score:.4f}")

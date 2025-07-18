@@ -1,11 +1,12 @@
+
 import os
 import torch
+import soundfile as sf
 from diffusers import AudioLDMPipeline, UNet2DConditionModel
 from diffusers import DiffusionPipeline
 from diffusers.utils import convert_state_dict_to_diffusers
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 from safetensors.torch import load_file
-import soundfile as sf
 
 def main():
     # 기본 설정
@@ -58,4 +59,6 @@ def main():
     print(f"Generated audio saved to: {output_path}")
 
 if __name__ == "__main__":
+    main()
+
     main()
