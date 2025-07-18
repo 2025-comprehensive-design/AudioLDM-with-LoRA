@@ -132,6 +132,7 @@ class HfAudioDataset(Dataset):
             max_length=512,
             return_tensors="pt"
         )
+        
         input_ids, attention_mask = inputs.input_ids, inputs.attention_mask
         # input_ids = inputs.input_ids.squeeze(0)
         # attention_mask = inputs.attention_mask.squeeze(0)

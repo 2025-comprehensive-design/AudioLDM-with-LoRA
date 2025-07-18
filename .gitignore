@@ -21,5 +21,6 @@ script/train/AudioLDM-with-LoRA/
 /data/LoRA_weight/
 /data/dataset/out/
 /script/inference/generated_audio_LoRA/
+/script/inference/generated_audio_Base/
 /script/inference/referaudio/
 generated_audio/

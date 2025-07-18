@@ -10,7 +10,7 @@ pipe = pipe.to("cuda")
 # lora_weight_pth = ""
 # pipe.unet.load_attn_procs(lora_weight_pth)
 
-prompt = "classic music sound like sad and piano"
+prompt = "This instrumental track blends lively flute melodies together with punchy drums, delivering a unique listening experience that captivates the ear without the need for vocals. The subgenre of hip-hop is boom bap."
 audio = pipe(prompt, num_inference_steps=200, audio_length_in_s=4.0).audios[0]
 
-scipy.io.wavfile.write("techno.wav", rate=16000, data=audio)
+scipy.io.wavfile.write("Base003.wav", rate=16000, data=audio)

@@ -52,7 +52,7 @@ def calc_kernel_audio_distance(x, y, device="cuda", bandwidth=None):
 
     return (k_xx_mean + k_yy_mean - 2 * k_xy_mean).item()
 
-def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device):
+def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1):
     gen_embeds, ref_embeds = [], []
 
     for gen, ref in zip(gen_audios, ref_audios):
@@ -72,11 +72,11 @@ def compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device
     gen_tensor = torch.stack(gen_embeds)
     ref_tensor = torch.stack(ref_embeds)
 
-    return calc_kernel_audio_distance(gen_tensor, ref_tensor, device=device)
+    return calc_kernel_audio_distance(gen_tensor, ref_tensor, device=device, bandwidth=bandwidth)
 
 def main():
     prompt = "This instrumental track blends lively flute melodies together with punchy drums, delivering a unique listening experience that captivates the ear without the need for vocals. The subgenre of hip-hop is boom bap."
-    gen_dir = "/home/2020112030/WorkSpace/2025/AudioLDM-with-LoRA/script/inference/generated_audio_LoRA/r2_alpha2/97000"
+    gen_dir = "/home/2020112030/WorkSpace/2025/AudioLDM-with-LoRA/script/inference/generated_audio_LoRA/r2_alpha4/19400"
     ref_dir = "/home/2020112030/WorkSpace/2025/AudioLDM-with-LoRA/script/inference/referaudio"
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -109,7 +109,7 @@ def main():
     print(f"\nAverage CLAP Score: {avg_clap:.4f}")
 
     # KAD score
-    kad_score = compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device)
+    kad_score = compute_kad_score(gen_audios, ref_audios, clap_model, clap_processor, device, bandwidth=1)
     print(f"\nKAD Score (Generated vs. Reference): {kad_score:.4f}")
 
 if __name__ == "__main__":
