@@ -40,16 +40,20 @@ Keywords: text-to-music generation; Parameter-Efficient Fine-Tuning (PEFT); low-
 
 1.  **Create and activate a conda environment:**
 
-    ```shell
+    ```bash
     conda create -n audioldm python=3.8
     conda activate audioldm
     ```
 
 2.  **Install dependencies:**
+    ```bash
+    # Install AudioLDM
+    pip3 install git+https://github.com/haoheliu/AudioLDM.git
+    ```
 
     Clone the repository and install the required packages from `requirements.txt`.
 
-    ```shell
+    ```bash
     git clone <repository-url>
     cd AudioLDM-with-LoRA
     pip install -r requirements.txt
