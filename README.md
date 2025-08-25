@@ -12,11 +12,10 @@ This repository contains code for fine-tuning the Text-to-Audio model, AudioLDM,
 
 ## Abstract
 
-```text
 Recent advancements in generative artificial intelligence have significantly progressed the field of text-to-music generation, enabling users to create music from natural language descriptions. Despite the success of various models, such as MusicLM, MusicGen, and AudioLDM, the current approaches struggle to capture fine-grained genre-specific characteristics, precisely control musical attributes, and handle underrepresented cultural data. This paper introduces a novel, lightweight fine-tuning method for the AudioLDM framework using low-rank adaptation (LoRA). By updating only selected attention and projection layers, the proposed method enables efficient adaptation to musical genres with limited data and computational cost. The proposed method enhances controllability over key musical parameters such as rhythm, emotion, and timbre. At the same time, it maintains the overall quality of music generation. This paper represents the first application of LoRA in AudioLDM, offering a scalable solution for fine-grained, genre-aware music generation and customization. The experimental results demonstrate that the proposed method improves the semantic alignment and statistical similarity compared with the baseline. The contrastive language–audio pretraining score increased by 0.0498, indicating enhanced text-music consistency. The kernel audio distance score decreased by 0.8349, reflecting improved similarity to real music distributions. The mean opinion score ranged from 3.5 to 3.8, confirming the perceptual quality of the generated music.
 
 Keywords: text-to-music generation; Parameter-Efficient Fine-Tuning (PEFT); low-rank adaptation (LoRA)
-```
+
 
 ## Project Structure
 
