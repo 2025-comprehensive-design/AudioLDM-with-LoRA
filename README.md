@@ -108,8 +108,10 @@ Keywords: text-to-music generation; Parameter-Efficient Fine-Tuning (PEFT); low-
 
 If you find this work useful, please cite our paper:
 
-```
+<div>
+
 Kim, S., Kim, G., Yagishita, S., Han, D., Im, J., & Sung, Y. (2025). Enhancing Diffusion-Based Music Generation Performance with LoRA. Applied Sciences, 15(15), 8646. https://doi.org/10.3390/app15158646
-```
+
+</div>
 
 ---
