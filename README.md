@@ -1,8 +1,14 @@
+<div align="center">
+
 # AudioLDM with LoRA
 
-### **"Enhancing Diffusion-Based Music Generation Performance with LoRA"**.
+### **Enhancing Diffusion-Based Music Generation Performance with LoRA**.
 
----
+Kim, Seonpyo, Geonhui Kim, Shoki Yagishita, Daewoon Han, Jeonghyeon Im, and Yunsick Sung. 2025. "Enhancing Diffusion-Based Music Generation Performance with LoRA" Applied Sciences 15, no. 15: 8646. https://doi.org/10.3390/app15158646
+
+[![MDPI – Applied Sciences](https://img.shields.io/badge/MDPI-Applied%20Sciences-1D4B8F.svg?style=flat-square)](https://www.mdpi.com/2076-3417/15/15/8646)
+
+</div>
 
 ## Overview
 
