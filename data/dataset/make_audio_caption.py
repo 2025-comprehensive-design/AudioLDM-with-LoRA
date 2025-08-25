@@ -3,7 +3,7 @@ from datasets import load_dataset, Audio
 import soundfile as sf
 
 # 1. 데이터셋 로드 및 필터링
-dataset = load_dataset("AndreiBlahovici/LP-MusicCaps-MTT", split="valid")
+dataset = load_dataset("Rofla/AudioLDM-with-LoRA-Hiphop-subgenre", split="train")
 
 # "hip hop" 포함 + "low quality" 미포함 필터링
 filtered_dataset = dataset.filter(lambda example: "hip hop" in example["genre"].lower())
@@ -17,7 +17,7 @@ os.makedirs(output_audio_dir, exist_ok=True)
 os.makedirs(output_caption_dir, exist_ok=True)
 
 # 3. 데이터셋 내의 오디오를 wav로, 캡션을 txt로 저장
-for idx, example in enumerate(filtered_dataset):
+for idx, example in enumerate(dataset):
     # 오디오 저장 (.wav)
     audio = example["audio"]  # dict with keys: 'array', 'sampling_rate'
     wav_path = os.path.join(output_audio_dir, f"audio_{idx:05d}.wav")

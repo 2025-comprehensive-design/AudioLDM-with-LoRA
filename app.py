@@ -10,7 +10,7 @@ pipe = pipe.to("cuda")
 # lora_weight_pth = ""
 # pipe.unet.load_attn_procs(lora_weight_pth)
 
-prompt = "This instrumental track blends lively flute melodies together with punchy drums, delivering a unique listening experience that captivates the ear without the need for vocals. The subgenre of hip-hop is boom bap."
-audio = pipe(prompt, num_inference_steps=200, audio_length_in_s=4.0).audios[0]
+prompt = "The Hip Hop song features a flat male vocal rapping over repetitive, echoing piano melody, claps and punchy kick hits. At the very beginning of the loop, there are stuttering hi hats, sustained synth bass and filtered, pitched up female chant playing. It sounds groovy and addictive - thanks to the way rappers are rapping. The subgenre of hip-hop is boom bap"
+audio = pipe(prompt, num_inference_steps=200, audio_length_in_s=10.0).audios[0]
 
 scipy.io.wavfile.write("Base003.wav", rate=16000, data=audio)

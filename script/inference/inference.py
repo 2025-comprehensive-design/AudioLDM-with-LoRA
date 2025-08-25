@@ -117,7 +117,7 @@ def main():
     # CLAP score
     print("\nCLAP Scores (Prompt vs. Generated):")
     clap_scores = []
-    for i, audio in enumerate(gen_audios):
+    
     for i, audio in enumerate(gen_audios):
         resampled_audio = librosa.resample(audio, orig_sr=16000, target_sr=48000)
         score = compute_clap_score(resampled_audio, prompt, clap_model, clap_processor, device)
